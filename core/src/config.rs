@@ -21,7 +21,10 @@ pub struct HarnessConfig {
     pub db_path: String,
     #[serde(default = "default_poll_interval")]
     pub poll_interval_seconds: u64,
+    #[serde(default = "default_workspace")]
+    pub workspace_dir: String,
     pub agent_token: Option<String>,
+    pub admin_token: Option<String>,
     pub python_bin: Option<String>,
 }
 
@@ -65,6 +68,9 @@ fn default_daily_limit() -> f64 {
 fn default_alert_threshold() -> u32 {
     80
 }
+fn default_workspace() -> String {
+    "./workspace".to_string()
+}
 fn default_true() -> bool {
     true
 }
@@ -83,7 +89,9 @@ impl Config {
                 port: default_port(),
                 db_path: default_db_path(),
                 poll_interval_seconds: default_poll_interval(),
+                workspace_dir: default_workspace(),
                 agent_token: None,
+                admin_token: None,
                 python_bin: None,
             },
             budget: BudgetConfig {

@@ -57,6 +57,7 @@ pub struct Proposal {
     pub description: String,
     pub provider_name: String,
     pub resource_request: ResourceRequest,
+    pub config: serde_json::Value,
     pub budget_cap_usd: f64,
     pub estimated_minutes: Option<u32>,
     pub tags: serde_json::Value,
@@ -89,6 +90,20 @@ pub struct JobResult {
     pub artifacts_path: Option<String>,
 }
 
+/// Provider-specific sprint config (e.g. command, env vars, working_dir)
+/// For local Docker provider: {"command": ["python", "train.py"], "env": {"FOO": "bar"}}
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SprintConfig {
+    /// Command to run inside the container
+    #[serde(default)]
+    pub command: Vec<String>,
+    /// Environment variables
+    #[serde(default)]
+    pub env: std::collections::HashMap<String, String>,
+    /// Working directory inside container
+    pub working_dir: Option<String>,
+}
+
 /// Request body for POST /proposals
 #[derive(Debug, Deserialize)]
 pub struct CreateProposalRequest {
@@ -96,6 +111,8 @@ pub struct CreateProposalRequest {
     pub description: String,
     pub provider: String,
     pub resource_request: ResourceRequest,
+    #[serde(default)]
+    pub config: serde_json::Value,
     pub estimated_minutes: Option<u32>,
     pub budget_cap_usd: f64,
     #[serde(default)]

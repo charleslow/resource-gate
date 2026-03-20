@@ -25,6 +25,14 @@ class ResourceRequest:
 
 
 @dataclass
+class SprintConfig:
+    """Provider-specific config passed through from the proposal."""
+    command: list[str] = field(default_factory=list)
+    env: dict[str, str] = field(default_factory=dict)
+    working_dir: str | None = None
+
+
+@dataclass
 class JobHandle:
     provider_name: str
     provider_job_id: str
@@ -57,7 +65,9 @@ class ComputeProvider(Protocol):
 
     def capabilities(self) -> ProviderCapabilities: ...
 
-    async def launch(self, request: ResourceRequest) -> JobHandle: ...
+    async def launch(
+        self, request: ResourceRequest, config: SprintConfig, workspace_dir: str
+    ) -> JobHandle: ...
 
     async def poll(self, handle: JobHandle) -> JobStatus | JobResult: ...
 

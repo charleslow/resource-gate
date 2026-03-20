@@ -22,13 +22,15 @@ pub enum ProviderResponse {
 pub struct ProviderBridge {
     python_bin: String,
     integrations_path: String,
+    workspace_dir: String,
 }
 
 impl ProviderBridge {
-    pub fn new(python_bin: String, integrations_path: String) -> Self {
+    pub fn new(python_bin: String, integrations_path: String, workspace_dir: String) -> Self {
         Self {
             python_bin,
             integrations_path,
+            workspace_dir,
         }
     }
 
@@ -69,11 +71,14 @@ impl ProviderBridge {
         &self,
         provider: &str,
         request: &ResourceRequest,
+        config: &serde_json::Value,
     ) -> anyhow::Result<JobHandle> {
         let cmd = serde_json::json!({
             "method": "launch",
             "provider": provider,
             "request": request,
+            "config": config,
+            "workspace_dir": self.workspace_dir,
         });
         let resp = self.call(cmd).await?;
         let data = &resp["data"];

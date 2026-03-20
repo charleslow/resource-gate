@@ -5,16 +5,15 @@ Reads a single JSON command from stdin, dispatches to the appropriate
 ComputeProvider method, writes a JSON response to stdout, then exits.
 
 Usage:
-    echo '{"method": "launch", "provider": "local", "request": {...}}' | python -m integrations.provider_host
+    echo '{"method": "launch", "provider": "local", ...}' | python -m integrations.provider_host
 """
 
 import asyncio
 import json
 import sys
-import time
 from dataclasses import asdict
 
-from .providers.interface import JobHandle, JobStatus, ResourceRequest
+from .providers.interface import JobHandle, JobStatus, ResourceRequest, SprintConfig
 from .providers.local import LocalProvider
 
 PROVIDERS = {
@@ -28,13 +27,24 @@ def _serialize_response(obj) -> dict:
         return {"type": "handle", "data": asdict(obj)}
     elif isinstance(obj, JobStatus):
         return {"type": "status", "data": {"status": obj.value}}
-    elif hasattr(obj, "status"):
+    elif hasattr(obj, "status") and hasattr(obj, "gpu_seconds"):
         # JobResult
         d = asdict(obj)
         d["status"] = obj.status.value
         return {"type": "result", "data": d}
     else:
         return {"type": "ok", "data": None}
+
+
+def _parse_sprint_config(raw: dict | None) -> SprintConfig:
+    """Parse sprint config from JSON, handling missing fields."""
+    if not raw:
+        return SprintConfig()
+    return SprintConfig(
+        command=raw.get("command", []),
+        env=raw.get("env", {}),
+        working_dir=raw.get("working_dir"),
+    )
 
 
 async def handle_command(cmd: dict) -> dict:
@@ -51,8 +61,13 @@ async def handle_command(cmd: dict) -> dict:
 
     elif method == "launch":
         req_data = cmd["request"]
-        request = ResourceRequest(**req_data)
-        handle = await provider.launch(request)
+        request = ResourceRequest(**{
+            k: v for k, v in req_data.items()
+            if k in ResourceRequest.__dataclass_fields__
+        })
+        config = _parse_sprint_config(cmd.get("config"))
+        workspace_dir = cmd.get("workspace_dir", "/workspace")
+        handle = await provider.launch(request, config, workspace_dir)
         return _serialize_response(handle)
 
     elif method == "poll":

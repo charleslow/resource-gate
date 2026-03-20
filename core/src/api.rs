@@ -1,9 +1,15 @@
 // HTTP API handlers (axum)
 // Endpoints: /proposals, /budget, /providers, /system
+//
+// Auth: two token roles.
+// - agent_token: can submit proposals, query status, complete sprints
+// - admin_token: can approve/reject proposals, pause/resume, kill
+// If no tokens configured, all endpoints are open (dev mode).
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, Request, State},
     http::StatusCode,
+    middleware::{self, Next},
     response::IntoResponse,
     routing::{delete, get, post},
     Json, Router,
@@ -24,24 +30,106 @@ pub struct AppState {
     pub budget: Arc<BudgetEnforcer>,
     pub bridge: Arc<ProviderBridge>,
     pub paused: Arc<AtomicBool>,
+    pub agent_token: Option<String>,
+    pub admin_token: Option<String>,
+}
+
+/// Extract bearer token from Authorization header.
+fn extract_token(req: &Request) -> Option<String> {
+    req.headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(|s| s.to_string())
+}
+
+/// Middleware: requires agent token OR admin token (either role can access).
+async fn require_agent_or_admin(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    // If no tokens configured, allow all (dev mode)
+    if state.agent_token.is_none() && state.admin_token.is_none() {
+        return next.run(req).await;
+    }
+
+    let token = extract_token(&req);
+    let allowed = match token.as_deref() {
+        Some(t) => {
+            state.agent_token.as_deref() == Some(t) || state.admin_token.as_deref() == Some(t)
+        }
+        None => false,
+    };
+
+    if allowed {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(serde_json::json!({"error": "invalid or missing token"})),
+        )
+            .into_response()
+    }
+}
+
+/// Middleware: requires admin token only. Agent token is rejected.
+async fn require_admin(
+    State(state): State<AppState>,
+    req: Request,
+    next: Next,
+) -> impl IntoResponse {
+    // If no admin token configured, allow all (dev mode)
+    if state.admin_token.is_none() {
+        return next.run(req).await;
+    }
+
+    let token = extract_token(&req);
+    let allowed = match token.as_deref() {
+        Some(t) => state.admin_token.as_deref() == Some(t),
+        None => false,
+    };
+
+    if allowed {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "admin access required"})),
+        )
+            .into_response()
+    }
 }
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    // Agent routes: submit, query, complete
+    let agent_routes = Router::new()
         .route("/proposals", post(create_proposal))
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
-        .route("/proposals/{id}", delete(cancel_proposal))
-        .route("/proposals/{id}/approve", post(approve_proposal))
-        .route("/proposals/{id}/reject", post(reject_proposal))
         .route("/proposals/{id}/complete", post(complete_proposal))
         .route("/budget", get(get_budget))
         .route("/providers", get(list_providers))
         .route("/system/status", get(system_status))
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_agent_or_admin,
+        ));
+
+    // Admin routes: approve, reject, cancel, pause, resume, kill
+    let admin_routes = Router::new()
+        .route("/proposals/{id}/approve", post(approve_proposal))
+        .route("/proposals/{id}/reject", post(reject_proposal))
+        .route("/proposals/{id}", delete(cancel_proposal))
         .route("/system/pause", post(system_pause))
         .route("/system/resume", post(system_resume))
         .route("/system/kill-all", post(kill_all))
-        .with_state(state)
+        .route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            require_admin,
+        ));
+
+    agent_routes.merge(admin_routes).with_state(state)
 }
 
 // -- Proposals --
@@ -83,6 +171,7 @@ async fn create_proposal(
         description: req.description,
         provider_name: req.provider,
         resource_request: req.resource_request,
+        config: req.config,
         budget_cap_usd: req.budget_cap_usd,
         estimated_minutes: req.estimated_minutes,
         tags: req.tags,

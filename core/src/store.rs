@@ -50,6 +50,7 @@ impl Store {
                 description TEXT NOT NULL DEFAULT '',
                 provider_name TEXT NOT NULL,
                 resource_request TEXT NOT NULL,
+                config TEXT NOT NULL DEFAULT '{}',
                 budget_cap_usd REAL NOT NULL,
                 estimated_minutes INTEGER,
                 tags TEXT NOT NULL DEFAULT '{}',
@@ -95,10 +96,10 @@ impl Store {
         conn.execute(
             "INSERT INTO proposals (
                 id, status, sprint_name, description, provider_name,
-                resource_request, budget_cap_usd, estimated_minutes, tags,
+                resource_request, config, budget_cap_usd, estimated_minutes, tags,
                 provider_job_id, created_at, approved_at, dispatched_at,
                 started_at, ended_at, result_payload, error, kill_reason
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 p.id,
                 p.status.to_string(),
@@ -106,6 +107,7 @@ impl Store {
                 p.description,
                 p.provider_name,
                 serde_json::to_string(&p.resource_request)?,
+                p.config.to_string(),
                 p.budget_cap_usd,
                 p.estimated_minutes,
                 p.tags.to_string(),
@@ -127,7 +129,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, status, sprint_name, description, provider_name,
-                    resource_request, budget_cap_usd, estimated_minutes, tags,
+                    resource_request, config, budget_cap_usd, estimated_minutes, tags,
                     provider_job_id, created_at, approved_at, dispatched_at,
                     started_at, ended_at, result_payload, error, kill_reason
              FROM proposals WHERE id = ?1",
@@ -313,8 +315,9 @@ fn today_start_epoch() -> f64 {
 fn row_to_proposal(row: &rusqlite::Row) -> anyhow::Result<Proposal> {
     let status_str: String = row.get(1)?;
     let rr_str: String = row.get(5)?;
-    let tags_str: String = row.get(8)?;
-    let result_str: Option<String> = row.get(15)?;
+    let config_str: String = row.get(6)?;
+    let tags_str: String = row.get(9)?;
+    let result_str: Option<String> = row.get(16)?;
 
     Ok(Proposal {
         id: row.get(0)?,
@@ -323,17 +326,18 @@ fn row_to_proposal(row: &rusqlite::Row) -> anyhow::Result<Proposal> {
         description: row.get(3)?,
         provider_name: row.get(4)?,
         resource_request: serde_json::from_str(&rr_str)?,
-        budget_cap_usd: row.get(6)?,
-        estimated_minutes: row.get(7)?,
+        config: serde_json::from_str(&config_str)?,
+        budget_cap_usd: row.get(7)?,
+        estimated_minutes: row.get(8)?,
         tags: serde_json::from_str(&tags_str)?,
-        provider_job_id: row.get(9)?,
-        created_at: row.get(10)?,
-        approved_at: row.get(11)?,
-        dispatched_at: row.get(12)?,
-        started_at: row.get(13)?,
-        ended_at: row.get(14)?,
+        provider_job_id: row.get(10)?,
+        created_at: row.get(11)?,
+        approved_at: row.get(12)?,
+        dispatched_at: row.get(13)?,
+        started_at: row.get(14)?,
+        ended_at: row.get(15)?,
         result_payload: result_str.map(|s| serde_json::from_str(&s)).transpose()?,
-        error: row.get(16)?,
-        kill_reason: row.get(17)?,
+        error: row.get(17)?,
+        kill_reason: row.get(18)?,
     })
 }

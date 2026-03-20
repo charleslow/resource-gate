@@ -43,6 +43,12 @@ async fn main() -> anyhow::Result<()> {
         store.clone(),
     ));
 
+    // Create workspace directory
+    let workspace_dir = std::path::PathBuf::from(&config.harness.workspace_dir);
+    std::fs::create_dir_all(&workspace_dir)?;
+    let workspace_abs = std::fs::canonicalize(&workspace_dir)?;
+    tracing::info!("workspace at {}", workspace_abs.display());
+
     // Init provider bridge
     let integrations_path = std::env::current_dir()?
         .parent()
@@ -52,6 +58,7 @@ async fn main() -> anyhow::Result<()> {
     let bridge = Arc::new(provider_bridge::ProviderBridge::new(
         config.python_bin().to_string(),
         integrations_path.to_string_lossy().to_string(),
+        workspace_abs.to_string_lossy().to_string(),
     ));
 
     // Start dispatcher
@@ -74,6 +81,8 @@ async fn main() -> anyhow::Result<()> {
         budget,
         bridge,
         paused: paused_flag,
+        agent_token: config.harness.agent_token.clone(),
+        admin_token: config.harness.admin_token.clone(),
     };
     let app = api::router(state);
 

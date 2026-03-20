@@ -77,7 +77,7 @@ impl Dispatcher {
         for proposal in approved {
             tracing::info!("dispatching proposal {}: {}", proposal.id, proposal.sprint_name);
 
-            match self.bridge.launch(&proposal.provider_name, &proposal.resource_request).await {
+            match self.bridge.launch(&proposal.provider_name, &proposal.resource_request, &proposal.config).await {
                 Ok(handle) => {
                     self.store
                         .set_dispatching(&proposal.id, &handle.provider_job_id)?;
