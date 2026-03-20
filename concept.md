@@ -575,16 +575,28 @@ api_key_file = "/etc/claw-harness/runpod.key"
 
 ---
 
+## Decisions
+
+1. **Credential isolation**: The agent is sandboxed to its workdir with no file access to provider credentials. The harness must never leak credentials to the agent via API responses.
+
+2. **Budget overrun is trivial**: The polling-interval overrun window is accepted as negligible across all GPU tiers. No additional mitigation needed.
+
+3. **No auto provider selection**: The agent must always specify an explicit provider. Remove `"auto"` as an option. Provider selection is the agent's (and human approver's) responsibility.
+
+4. **No batch proposals in v1**: Remove batch proposal support (`POST /proposals/batch`, `batch_id`, per-batch budget) from the initial implementation. Can revisit later.
+
+5. **Telegram callback ID encoded in callback data**: The bot encodes the proposal ID directly in the Telegram inline keyboard callback data (e.g. `"approve:prop_a1b2c3"`). No server-side callback mapping table needed. Telegram's webhook signature verification ensures callback authenticity. The bot remains fully stateless.
+
+6. **Hard agent budget ceiling**: The harness enforces a hard secondary budget ceiling for the agent, set below the daily limit. This leaves headroom for manual experiments. The agent cannot exceed this ceiling even if the daily limit has remaining capacity.
+
+---
+
 ## Open questions
 
-1. **Should the agent be able to propose its own provider, or should the harness always select?** Current design allows both (`"auto"` or explicit). May want to restrict the agent to `"auto"` only and let provider selection be a harness-side policy.
+1. **Webhook vs polling for provider status.** Modal doesn't natively support completion webhooks; RunPod does. The current design uses polling for simplicity. A webhook optimization for RunPod could reduce latency and harness load.
 
-2. **Webhook vs polling for provider status.** Modal doesn't natively support completion webhooks; RunPod does. The current design uses polling for simplicity. A webhook optimization for RunPod could reduce latency and harness load.
+2. **Artifact retrieval.** How and when to pull results back from remote providers. Eagerly on completion? On-demand when queried? Modal volumes persist but cost storage. RunPod network volumes have their own pricing. Probably: pull critical outputs (metrics, small checkpoints) immediately, leave large artifacts (full model weights) in provider storage with a TTL.
 
-3. **Artifact retrieval.** How and when to pull results back from remote providers. Eagerly on completion? On-demand when queried? Modal volumes persist but cost storage. RunPod network volumes have their own pricing. Probably: pull critical outputs (metrics, small checkpoints) immediately, leave large artifacts (full model weights) in provider storage with a TTL.
+3. **Multi-user.** Currently designed for a single human approver. If this grows to a team tool, need role-based approval (who can approve jobs over $X?).
 
-4. **Multi-user.** Currently designed for a single human approver. If this grows to a team tool, need role-based approval (who can approve jobs over $X?).
-
-5. **Agent self-regulation.** The agent can query `/budget` before proposing. Should the harness enforce a softer "agent budget" (lower than the daily limit) to leave headroom for manual experiments?
-
-6. **Rate card staleness.** Provider pricing can change. The harness should periodically refresh rate cards, or at least warn if the cached rate card is older than N days.
+4. **Rate card staleness.** Provider pricing can change. The harness should periodically refresh rate cards, or at least warn if the cached rate card is older than N days.
