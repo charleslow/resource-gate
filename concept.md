@@ -2,7 +2,7 @@
 
 A human-gated compute harness for AI-driven ML experiments.
 
-The claw agent proposes experiments. A human approves them via Telegram. Approved work dispatches to pluggable compute providers (local GPU, Modal, RunPod, etc.) through a unified interface. Hard budget enforcement ensures no approved job can exceed its approved cost, and no cumulative spend can exceed configured limits.
+The claw agent proposes **sprints** — blocks of work that need compute resources. A human approves them via Telegram. Approved sprints dispatch to pluggable compute providers (local GPU, Modal, RunPod, etc.) through a unified interface. A sprint might be a series of dev runs, a full training run, an eval sweep, or any coherent unit of work the agent wants to do next. Hard budget enforcement ensures no approved sprint can exceed its approved cost, and no cumulative spend can exceed configured limits.
 
 ---
 
@@ -10,11 +10,11 @@ The claw agent proposes experiments. A human approves them via Telegram. Approve
 
 **The agent never holds provider credentials.** It talks to the harness over HTTP and can only submit proposals. The harness owns all secrets and all dispatch authority.
 
-**Nothing billable happens without explicit human approval.** Every proposal requires a human action (approve/reject) before any compute is provisioned. The only exception is if the human pre-approves a budget envelope for batch operations.
+**Nothing billable happens without explicit human approval.** Every sprint proposal requires a human action (approve/reject) before any compute is provisioned.
 
 **Providers are pluggable.** The harness defines an abstract provider interface. Each backend (local, Modal, RunPod) implements it using its own SDK/API. Adding a new provider means implementing the interface — no changes to the core harness, the approval flow, or the agent.
 
-**Hard enforcement, not advisory.** Budget limits are enforced by the harness at dispatch time and via active monitoring during execution. A job that approaches its approved budget is killed, not warned about.
+**Hard enforcement, not advisory.** Budget limits are enforced by the harness at dispatch time and via active monitoring during execution. A sprint that approaches its approved budget is killed, not warned about.
 
 **The harness is the single source of truth for cost.** Each provider reports usage, but the harness maintains its own ledger and computes costs from observed duration × known rates. Provider billing is used for reconciliation, not as the primary record.
 
@@ -24,7 +24,6 @@ The claw agent proposes experiments. A human approves them via Telegram. Approve
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│  Beelink mini PC                                    │
 │                                                     │
 │  ┌───────────┐    HTTP     ┌──────────────────────┐ │
 │  │ Claw      │────────────▶│ Harness API server   │ │
@@ -58,11 +57,11 @@ The claw agent proposes experiments. A human approves them via Telegram. Approve
                              └─────────────────────┘
 ```
 
-There are five components. All run on the Beelink except for the remote providers themselves.
+There are five components. All run on the claw device except for the remote providers themselves.
 
 ### Harness API server
 
-An HTTP server (FastAPI or similar) that the agent talks to. It exposes endpoints for submitting proposals, querying job status, querying budget, and reading results. It owns the SQLite databases and the dispatcher loop.
+An HTTP server (FastAPI or similar) that the agent talks to. It exposes endpoints for submitting proposals, querying sprint status, querying budget, and reading results. It owns the SQLite databases and the dispatcher loop.
 
 ### Proposal store
 
@@ -71,15 +70,15 @@ SQLite database tracking the lifecycle of every proposed experiment:
 
 ### Cost ledger
 
-SQLite database recording per-job and aggregate cost data. Queryable by the agent so it can self-regulate ("I've spent $4.20 of my $10 daily budget").
+SQLite database recording per-sprint and aggregate cost data. Queryable by the agent so it can self-regulate ("I've spent $4.20 of my $10 daily budget").
 
 ### Telegram bot
 
-Sends proposal summaries to the human. Receives approve/reject taps via inline keyboard buttons. Also sends completion notifications, budget alerts, and supports a `/kill` command. Reuses the existing picoclaw Telegram bot infrastructure and HMAC-signed dispatch pattern.
+Sends proposal summaries to the human. Receives approve/reject taps via inline keyboard buttons. Also sends completion notifications, budget alerts, and supports a `/kill` command.
 
 ### Dispatcher
 
-A background loop (asyncio task or separate thread) that watches for approved proposals, dispatches them to the appropriate provider, monitors running jobs, enforces timeouts/budgets, and records results.
+A background loop that ticks every 30 seconds. Each tick it queries the proposal store for actionable sprints (approved → need dispatching, running → need polling). For each, it spawns a short-lived Python provider process, sends a JSON command (launch/poll/cancel), reads the response, and updates the database. Provider processes are stateless and exit after each operation — the Rust core's SQLite database is the sole ledger of sprint state and provider job IDs.
 
 ---
 
@@ -145,10 +144,10 @@ class ComputeProvider(Protocol):
         """Return what this provider offers and its rate card."""
         ...
 
-    async def launch(self, request: ResourceRequest, config: dict) -> JobHandle:
+    async def launch(self, request: ResourceRequest) -> JobHandle:
         """
-        Start a job. Must return quickly (non-blocking).
-        `config` is the experiment configuration dict passed through from the proposal.
+        Start a sprint. Must return quickly (non-blocking).
+        Provisions the requested resources for the agent to use.
         Raises if the provider cannot fulfill the ResourceRequest.
         """
         ...
@@ -171,7 +170,7 @@ class ComputeProvider(Protocol):
 
 ### Provider: Local
 
-For experiments that run on the Beelink's own resources (CPU benchmarking, small model inference, data preprocessing).
+For experiments that run on the claw's own resources (CPU benchmarking, small model inference, data preprocessing).
 
 - `launch()` spawns a subprocess, returns PID as `provider_job_id`
 - `poll()` checks if the process is alive, reads exit code
@@ -203,50 +202,46 @@ Implement `ComputeProvider`. Register it with the harness at startup. That's it.
 
 ## Proposal lifecycle
 
-### 1. Agent submits a proposal
+### 1. Agent submits a sprint proposal
+
+A proposal is a resource request for the agent's next block of work (a "sprint"). It describes *what resources are needed* and *what the work is about*, but not the specific configs or parameters — those are the agent's concern once the sprint is approved.
 
 ```
 POST /proposals
 {
-    "experiment_name": "lr_sweep_embedding_v3",
-    "provider": "modal",           // or "local", "runpod", "auto"
+    "sprint_name": "embedding_model_dev",
+    "description": "Dev runs to iterate on embedding model architecture. Will try 3-5 short training runs with different layer configs, evaluate on holdout set, and pick the best candidate for a full run.",
+    "provider": "modal",           // or "local", "runpod"
     "resource_request": {
         "gpu": "A100-40GB",
-        "timeout_seconds": 1800
+        "timeout_seconds": 7200
     },
-    "config": {
-        "model": "bert-small",
-        "learning_rate": 3e-4,
-        "epochs": 10,
-        "dataset": "govsg_jobs_v2"
-    },
-    "estimated_minutes": 20,
-    "budget_cap_usd": 0.80,
-    "tags": {"sweep_id": "lr_003", "project": "govsg-recommender"},
-    "batch_id": null
+    "estimated_minutes": 90,
+    "budget_cap_usd": 3.00,
+    "tags": {"project": "govsg-recommender"}
 }
 ```
 
-If `provider` is `"auto"`, the harness selects the cheapest provider that can fulfill the `resource_request` from its registered providers.
-
 The harness validates the proposal (provider exists, GPU type available, budget cap is within daily limits) and writes it to the proposal store with status `pending`.
 
-Returns: `{"proposal_id": "prop_a1b2c3", "status": "pending", "estimated_cost_usd": 0.70}`
+Returns: `{"proposal_id": "prop_a1b2c3", "status": "pending", "estimated_cost_usd": 2.50}`
 
 ### 2. Human receives Telegram notification
 
 ```
-🔬 New proposal: lr_sweep_embedding_v3
+🔬 New sprint: embedding_model_dev
+
+Dev runs to iterate on embedding model
+architecture. Will try 3-5 short training
+runs with different layer configs, evaluate
+on holdout set, and pick the best candidate
+for a full run.
 
 Provider:  Modal
 GPU:       A100-40GB
-Timeout:   30 min
-Est. cost: $0.70 (cap: $0.80)
+Timeout:   2 hr
+Est. cost: $2.50 (cap: $3.00)
 Daily:     $4.20 / $10.00 used
-
-Config:
-  model: bert-small
-  lr: 3e-4, epochs: 10
 
 [✅ Approve]  [❌ Reject]  [📋 Details]
 ```
@@ -256,95 +251,65 @@ Config:
 Approve → status becomes `approved`, dispatcher picks it up.
 Reject → status becomes `rejected`, agent is notified via the status endpoint.
 
-### 4. Dispatcher launches the job
+### 4. Dispatcher launches the sprint
 
-The dispatcher picks up approved proposals, calls `provider.launch()`, and transitions the status to `dispatching` → `running`. It stores the `JobHandle` for subsequent polling.
+The dispatcher picks up approved proposals, calls `provider.launch()`, and transitions the status to `dispatching` → `running`. It stores the `JobHandle` for subsequent polling. The agent is free to execute whatever work it needs within the approved resource and budget envelope.
 
 ### 5. Monitor loop
 
-The dispatcher polls running jobs on a configurable interval (e.g. every 10 seconds). For each running job it:
+The dispatcher polls running sprints every 30 seconds (configurable). For each running sprint it:
 
 1. Calls `provider.poll(handle)` to get current status
 2. Computes elapsed GPU time and current cost
 3. If cost exceeds the approved `budget_cap_usd` → calls `provider.cancel(handle)`, marks as `killed`
 4. If elapsed time exceeds `timeout_seconds` → calls `provider.cancel(handle)`, marks as `killed`
-5. If job completed or failed → records the `JobResult`, updates cost ledger
+5. If sprint completed or failed → records the `JobResult`, updates cost ledger
 
 ### 6. Completion notification
 
 ```
-✅ Completed: lr_sweep_embedding_v3
+✅ Completed: embedding_model_dev
 
-Duration: 18m 42s
-Cost:     $0.65
+Duration: 1h 22m
+Cost:     $2.30
 GPU:      A100-40GB (Modal)
 
 Result:
-  loss: 0.042
-  checkpoint: /vol/checkpoints/run_17
+  4 dev runs completed
+  best checkpoint: /vol/checkpoints/run_17
 
-Daily spend: $4.85 / $10.00
+Daily spend: $6.50 / $10.00
 ```
-
----
-
-## Batch proposals
-
-For hyperparameter sweeps, the agent submits a batch:
-
-```
-POST /proposals/batch
-{
-    "batch_name": "lr_sweep_embedding_v3",
-    "provider": "modal",
-    "resource_request": { "gpu": "A100-40GB", "timeout_seconds": 1800 },
-    "configs": [
-        {"learning_rate": 1e-4, "epochs": 10},
-        {"learning_rate": 3e-4, "epochs": 10},
-        {"learning_rate": 1e-3, "epochs": 10},
-        {"learning_rate": 3e-3, "epochs": 5}
-    ],
-    "total_budget_cap_usd": 3.00,
-    "max_concurrent": 2,
-    "tags": {"sweep_id": "lr_003"}
-}
-```
-
-The human approves or rejects the batch as a unit. The dispatcher manages concurrency within the batch and enforces the total budget across all jobs in the batch — if cumulative cost approaches the cap, remaining queued jobs are cancelled.
 
 ---
 
 ## Budget enforcement
 
-Budgets are enforced at three levels. All three are hard limits — exceeding any one triggers a kill or rejection.
+Budgets are enforced at two levels. Both are hard limits — exceeding either triggers a kill or rejection.
 
-### Per-job budget
+### Per-sprint budget
 
-Set by the agent in `budget_cap_usd` on each proposal. The human sees it and approves it. The dispatcher kills any job whose computed cost (`elapsed_gpu_seconds × rate`) reaches this cap. There is a small overrun window (one poll interval × rate), which is acceptable.
-
-### Per-batch budget
-
-Set by the agent in `total_budget_cap_usd`. The dispatcher tracks cumulative spend across all jobs in the batch. If cumulative spend approaches the cap, remaining queued jobs in the batch are cancelled.
+Set by the agent in `budget_cap_usd` on each proposal. The human sees it and approves it. The dispatcher kills any sprint whose computed cost (`elapsed_gpu_seconds × rate`) reaches this cap. There is a small overrun window (one poll interval × rate), which is acceptable.
 
 ### Daily budget
 
-Configured in the harness (not by the agent). The harness rejects any proposal whose `budget_cap_usd` would cause the projected daily total to exceed the daily limit. Even if the agent proposes a $0.50 job, if the daily limit is $10 and $9.80 has been spent, it's rejected at submission time — never sent to the human for approval.
+Configured in the harness (not by the agent). The harness rejects any proposal whose `budget_cap_usd` would cause the projected daily total to exceed the daily limit. Even if the agent proposes a $0.50 sprint, if the daily limit is $10 and $9.80 has been spent, it's rejected at submission time — never sent to the human for approval.
 
 ### Implementation
 
 ```python
-# Computed every poll interval for each running job
-elapsed_seconds = time.time() - job.started_at
-gpu_seconds = elapsed_seconds * job.resource_request.gpu_count
-current_cost = gpu_seconds * provider.rate_card[job.resource_request.gpu]
+# Computed every poll interval for each running sprint
+elapsed_seconds = time.time() - sprint.started_at
+gpu_seconds = elapsed_seconds * sprint.resource_request.gpu_count
+current_cost = gpu_seconds * provider.rate_card[sprint.resource_request.gpu]
 
-if current_cost >= job.budget_cap_usd:
-    await provider.cancel(job.handle)
-    job.status = "killed"
-    job.kill_reason = "per_job_budget_exceeded"
+if current_cost >= sprint.budget_cap_usd:
+    await provider.cancel(sprint.handle)
+    sprint.status = "killed"
+    sprint.kill_reason = "per_sprint_budget_exceeded"
 ```
 
-The monitor loop runs every N seconds (configurable, default 10). The worst-case budget overrun is therefore `N × rate_per_second × gpu_count`. For an A100 at ~$0.00058/s with a 10-second interval, the maximum overrun is ~$0.006. Acceptable for this use case.
+The monitor loop runs every N seconds (configurable, default 30). The worst-case budget overrun is therefore `N × rate_per_second × gpu_count`. For an A100 at ~$0.00058/s with a 30-second interval, the maximum overrun is ~$0.017. Acceptable for this use case.
 
 ---
 
@@ -355,11 +320,10 @@ All communication between the agent and the harness is via HTTP. The harness run
 ### Proposals
 
 ```
-POST   /proposals              Submit a single proposal
-POST   /proposals/batch        Submit a batch proposal
+POST   /proposals              Submit a sprint proposal
 GET    /proposals/{id}         Get proposal status and result
 GET    /proposals?status=...   List proposals, filterable by status
-DELETE /proposals/{id}         Cancel a pending or running proposal
+DELETE /proposals/{id}         Cancel a pending or running sprint
 ```
 
 ### Budget
@@ -367,7 +331,7 @@ DELETE /proposals/{id}         Cancel a pending or running proposal
 ```
 GET    /budget                 Current daily spend, remaining budget, limits
 GET    /budget/history         Historical daily spend
-GET    /budget/ledger          Per-job cost records, filterable by tags
+GET    /budget/ledger          Per-sprint cost records, filterable by tags
 ```
 
 ### Providers
@@ -382,8 +346,8 @@ GET    /providers/{name}/rate-card   Current rate card for a provider
 ```
 POST   /system/pause           Pause the dispatcher (no new dispatches)
 POST   /system/resume          Resume the dispatcher
-POST   /system/kill-all        Cancel all running jobs immediately
-GET    /system/status          Dispatcher state, running job count, etc.
+POST   /system/kill-all        Cancel all running sprints immediately
+GET    /system/status          Dispatcher state, running sprint count, etc.
 ```
 
 ### Authentication
@@ -398,19 +362,18 @@ The Telegram bot is a thin interface between the human and the harness. It does 
 
 ### Notifications sent to the human
 
-- **New proposal**: summary with approve/reject inline keyboard
-- **Job started**: brief confirmation with provider and GPU info
-- **Job completed**: results summary, cost, daily spend update
-- **Job failed/killed**: error summary, kill reason
+- **New proposal**: sprint summary with approve/reject inline keyboard
+- **Sprint started**: brief confirmation with provider and GPU info
+- **Sprint completed**: results summary, cost, daily spend update
+- **Sprint failed/killed**: error summary, kill reason
 - **Budget alert**: when daily spend exceeds 80% of the daily limit
-- **Batch progress**: periodic summary for long-running batches ("3/8 complete, $1.20 spent")
 
 ### Commands from the human
 
 - Inline keyboard: **Approve** / **Reject** on proposal notifications
-- `/status` — summary of running jobs, daily spend
-- `/kill {proposal_id}` — cancel a specific job
-- `/kill all` — cancel all running jobs and pause dispatcher
+- `/status` — summary of running sprints, daily spend
+- `/kill {proposal_id}` — cancel a specific sprint
+- `/kill all` — cancel all running sprints and pause dispatcher
 - `/pause` — pause dispatcher
 - `/resume` — resume dispatcher
 - `/budget` — show daily budget status
@@ -435,13 +398,12 @@ This keeps the bot stateless. If the bot restarts, no approvals are lost — the
 | Column | Type | Description |
 |--------|------|-------------|
 | id | TEXT PK | `prop_{ulid}` |
-| batch_id | TEXT | nullable, groups batch proposals |
 | status | TEXT | pending, approved, rejected, dispatching, running, completed, failed, killed |
-| experiment_name | TEXT | human-readable label |
+| sprint_name | TEXT | short human-readable label |
+| description | TEXT | what the agent plans to do in this sprint |
 | provider_name | TEXT | "modal", "runpod", "local" |
 | resource_request | JSON | ResourceRequest as JSON |
-| config | JSON | experiment config passed to provider |
-| budget_cap_usd | REAL | per-job hard cap |
+| budget_cap_usd | REAL | per-sprint hard cap |
 | estimated_minutes | INT | agent's estimate |
 | tags | JSON | arbitrary key-value pairs |
 | provider_job_id | TEXT | set after dispatch |
@@ -517,7 +479,7 @@ resource-gate/
 │       ├── store.rs            # SQLite operations (rusqlite)
 │       ├── budget.rs           # budget enforcement logic
 │       ├── config.rs           # load config from TOML
-│       └── provider_bridge.rs  # JSON-over-stdio bridge to Python providers
+│       └── provider_bridge.rs  # spawns short-lived Python provider processes, JSON-over-stdio
 ├── integrations/               # Python — providers + Telegram
 │   ├── pyproject.toml
 │   └── src/
@@ -549,7 +511,7 @@ resource-gate/
 host = "127.0.0.1"
 port = 8420
 db_path = "./data/harness.db"
-poll_interval_seconds = 10
+poll_interval_seconds = 30
 agent_token_file = "/etc/claw-harness/agent.token"
 
 [budget]
@@ -582,15 +544,13 @@ api_key_file = "/etc/claw-harness/runpod.key"
 
 2. **Budget overrun is trivial**: The polling-interval overrun window is accepted as negligible across all GPU tiers. No additional mitigation needed.
 
-3. **No auto provider selection**: The agent must always specify an explicit provider. Remove `"auto"` as an option. Provider selection is the agent's (and human approver's) responsibility.
+3. **Telegram callback ID encoded in callback data**: The bot encodes the proposal ID directly in the Telegram inline keyboard callback data (e.g. `"approve:prop_a1b2c3"`). No server-side callback mapping table needed. Telegram's webhook signature verification ensures callback authenticity. The bot remains fully stateless.
 
-4. **No batch proposals in v1**: Remove batch proposal support (`POST /proposals/batch`, `batch_id`, per-batch budget) from the initial implementation. Can revisit later.
+4. **Hard agent budget ceiling**: The harness enforces a hard secondary budget ceiling for the agent, set below the daily limit. This leaves headroom for manual experiments. The agent cannot exceed this ceiling even if the daily limit has remaining capacity.
 
-5. **Telegram callback ID encoded in callback data**: The bot encodes the proposal ID directly in the Telegram inline keyboard callback data (e.g. `"approve:prop_a1b2c3"`). No server-side callback mapping table needed. Telegram's webhook signature verification ensures callback authenticity. The bot remains fully stateless.
+5. **Rust core + Python integrations**: The harness core (API server, dispatcher, budget enforcement, proposal store) is implemented in Rust for type safety and low overhead. Provider implementations and the Telegram bot remain in Python to leverage existing SDKs (Modal, RunPod, python-telegram-bot). The Rust core communicates with Python provider processes over JSON-over-stdin/stdout.
 
-6. **Hard agent budget ceiling**: The harness enforces a hard secondary budget ceiling for the agent, set below the daily limit. This leaves headroom for manual experiments. The agent cannot exceed this ceiling even if the daily limit has remaining capacity.
-
-7. **Rust core + Python integrations**: The harness core (API server, dispatcher, budget enforcement, proposal store) is implemented in Rust for type safety and low overhead. Provider implementations and the Telegram bot remain in Python to leverage existing SDKs (Modal, RunPod, python-telegram-bot). The Rust core communicates with Python provider processes over JSON-over-stdin/stdout.
+6. **Sprints, not individual jobs**: Proposals are sprint-level resource requests, not per-experiment configs. The agent describes what block of work it wants to do and what resources it needs. Once approved, the agent manages execution within the approved envelope.
 
 ---
 
