@@ -505,37 +505,38 @@ The harness API binds to `127.0.0.1` only. External access is only via the Teleg
 ## Directory structure
 
 ```
-claw-harness/
+resource-gate/
 ├── concept.md                  # this file
-├── pyproject.toml
-├── src/
-│   ├── harness/
-│   │   ├── __init__.py
-│   │   ├── api.py              # FastAPI app
-│   │   ├── dispatcher.py       # dispatch loop + monitor
-│   │   ├── models.py           # data classes (Proposal, JobHandle, etc.)
-│   │   ├── store.py            # SQLite operations (proposals, ledger)
-│   │   ├── budget.py           # budget enforcement logic
-│   │   └── config.py           # load config from TOML/env
-│   ├── providers/
-│   │   ├── __init__.py
-│   │   ├── interface.py        # ComputeProvider protocol + data classes
-│   │   ├── local.py            # LocalProvider
-│   │   ├── modal_provider.py   # ModalProvider
-│   │   └── runpod_provider.py  # RunPodProvider
-│   ├── telegram/
-│   │   ├── __init__.py
-│   │   ├── bot.py              # Telegram bot (polling or webhook)
-│   │   └── formatting.py       # message templates
-│   └── cli.py                  # optional CLI for admin ops
+├── core/                       # Rust — harness core
+│   ├── Cargo.toml
+│   └── src/
+│       ├── main.rs             # entry point, starts API server + dispatcher
+│       ├── api.rs              # axum HTTP handlers
+│       ├── dispatcher.rs       # dispatch loop + monitor
+│       ├── models.rs           # Proposal, JobHandle, JobResult, etc.
+│       ├── store.rs            # SQLite operations (rusqlite)
+│       ├── budget.rs           # budget enforcement logic
+│       ├── config.rs           # load config from TOML
+│       └── provider_bridge.rs  # JSON-over-stdio bridge to Python providers
+├── integrations/               # Python — providers + Telegram
+│   ├── pyproject.toml
+│   └── src/
+│       └── integrations/
+│           ├── __init__.py
+│           ├── provider_host.py    # stdin/stdout JSON bridge (provider process entry point)
+│           ├── providers/
+│           │   ├── __init__.py
+│           │   ├── interface.py    # ComputeProvider protocol + data classes
+│           │   ├── local.py        # LocalProvider
+│           │   ├── modal_provider.py
+│           │   └── runpod_provider.py
+│           └── telegram/
+│               ├── __init__.py
+│               ├── bot.py          # Telegram bot (polling or webhook)
+│               └── formatting.py   # message templates
 ├── modal_functions/
 │   ├── train.py                # generic training wrapper deployed to Modal
 │   └── eval.py                 # generic eval wrapper deployed to Modal
-├── tests/
-│   ├── test_budget.py
-│   ├── test_dispatcher.py
-│   ├── test_providers.py
-│   └── test_store.py
 └── config.toml                 # runtime config (not checked in)
 ```
 
@@ -588,6 +589,8 @@ api_key_file = "/etc/claw-harness/runpod.key"
 5. **Telegram callback ID encoded in callback data**: The bot encodes the proposal ID directly in the Telegram inline keyboard callback data (e.g. `"approve:prop_a1b2c3"`). No server-side callback mapping table needed. Telegram's webhook signature verification ensures callback authenticity. The bot remains fully stateless.
 
 6. **Hard agent budget ceiling**: The harness enforces a hard secondary budget ceiling for the agent, set below the daily limit. This leaves headroom for manual experiments. The agent cannot exceed this ceiling even if the daily limit has remaining capacity.
+
+7. **Rust core + Python integrations**: The harness core (API server, dispatcher, budget enforcement, proposal store) is implemented in Rust for type safety and low overhead. Provider implementations and the Telegram bot remain in Python to leverage existing SDKs (Modal, RunPod, python-telegram-bot). The Rust core communicates with Python provider processes over JSON-over-stdin/stdout.
 
 ---
 
