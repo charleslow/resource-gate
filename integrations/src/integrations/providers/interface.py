@@ -1,8 +1,9 @@
 """ComputeProvider protocol and shared data classes."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, asdict
 from enum import Enum
 from typing import Protocol
+import time
 
 
 class JobStatus(Enum):
@@ -41,9 +42,25 @@ class JobResult:
     artifacts_path: str | None
 
 
+@dataclass
+class ProviderCapabilities:
+    name: str
+    gpu_types: list[str]
+    max_concurrent_jobs: int
+    supports_cancel: bool
+    supports_spot: bool
+    rate_card: dict[str, float]  # gpu_type -> $/gpu-second
+
+
 class ComputeProvider(Protocol):
-    def capabilities(self) -> dict: ...
-    async def launch(self, request: ResourceRequest, config: dict) -> JobHandle: ...
+    """The contract every provider must fulfill."""
+
+    def capabilities(self) -> ProviderCapabilities: ...
+
+    async def launch(self, request: ResourceRequest) -> JobHandle: ...
+
     async def poll(self, handle: JobHandle) -> JobStatus | JobResult: ...
+
     async def cancel(self, handle: JobHandle) -> None: ...
+
     async def get_artifacts(self, handle: JobHandle, local_dest: str) -> None: ...
