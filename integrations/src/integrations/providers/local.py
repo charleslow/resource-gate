@@ -33,6 +33,14 @@ async def _run(cmd: list[str]) -> tuple[int, str, str]:
 class LocalProvider:
     """Runs sprints as Docker containers on the local machine."""
 
+    async def preflight(self) -> None:
+        """Verify Docker is available and responsive. Raises on failure."""
+        rc, stdout, stderr = await _run(["docker", "info", "--format", "{{.ServerVersion}}"])
+        if rc != 0:
+            raise RuntimeError(
+                f"Docker preflight check failed — is Docker installed and running? {stderr}"
+            )
+
     def capabilities(self) -> ProviderCapabilities:
         return ProviderCapabilities(
             name="local",

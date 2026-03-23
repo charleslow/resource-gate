@@ -63,7 +63,7 @@ fn default_poll_interval() -> u64 {
     30
 }
 fn default_daily_limit() -> f64 {
-    10.0
+    0.0 // 0 means unlimited — resource-gate is opt-in so no ceiling by default
 }
 fn default_alert_threshold() -> u32 {
     80
@@ -95,7 +95,7 @@ impl Config {
                 python_bin: None,
             },
             budget: BudgetConfig {
-                daily_limit_usd: default_daily_limit(),
+                daily_limit_usd: default_daily_limit(), // 0 = unlimited
                 alert_threshold_pct: default_alert_threshold(),
                 auto_pause_on_limit: false,
             },

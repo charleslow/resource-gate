@@ -71,6 +71,8 @@ class ProviderCapabilities:
 class ComputeProvider(Protocol):
     """The contract every provider must fulfill."""
 
+    async def preflight(self) -> None: ...
+
     def capabilities(self) -> ProviderCapabilities: ...
 
     async def launch(

@@ -55,7 +55,11 @@ async def handle_command(cmd: dict) -> dict:
     if provider is None:
         return {"error": f"unknown provider: {provider_name}"}
 
-    if method == "capabilities":
+    if method == "preflight":
+        await provider.preflight()
+        return {"type": "ok", "data": None}
+
+    elif method == "capabilities":
         caps = provider.capabilities()
         return {"type": "capabilities", "data": asdict(caps)}
 
