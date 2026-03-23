@@ -6,6 +6,9 @@ mod models;
 mod provider_bridge;
 mod store;
 
+#[cfg(test)]
+mod tests;
+
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;

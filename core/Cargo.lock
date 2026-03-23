@@ -537,11 +537,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "http-body-util",
  "rusqlite",
  "serde",
  "serde_json",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "ulid",
