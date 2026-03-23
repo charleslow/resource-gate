@@ -36,6 +36,14 @@ class SprintConfig:
 class JobHandle:
     provider_name: str
     provider_job_id: str
+    """Opaque string token that uniquely identifies the job within the provider.
+
+    The orchestrator never interprets this value — it stores it in SQLite and
+    passes it back verbatim to :meth:`ComputeProvider.poll` and
+    :meth:`ComputeProvider.cancel`.  Providers must ensure this single string
+    is sufficient to resume all operations on the job (e.g. a Docker container
+    ID, a cloud instance ARN, or a composite key like ``region:instance_id``).
+    """
     launched_at: float
 
 
@@ -67,7 +75,17 @@ class ComputeProvider(Protocol):
 
     async def launch(
         self, request: ResourceRequest, config: SprintConfig, workspace_dir: str
-    ) -> JobHandle: ...
+    ) -> JobHandle:
+        """Launch a job and return a handle the orchestrator can use to track it.
+
+        The returned :class:`JobHandle` must contain a ``provider_job_id`` that
+        is an opaque string token.  The orchestrator stores it in SQLite and
+        passes it back verbatim to :meth:`poll` and :meth:`cancel` — it never
+        interprets the value.  Providers must pack whatever state they need into
+        this single string (e.g. a Docker container ID, a cloud instance ARN,
+        or a composite key like ``region:instance_id``).
+        """
+        ...
 
     async def poll(self, handle: JobHandle) -> JobStatus | JobResult: ...
 
