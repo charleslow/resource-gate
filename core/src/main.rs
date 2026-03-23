@@ -61,6 +61,18 @@ async fn main() -> anyhow::Result<()> {
         workspace_abs.to_string_lossy().to_string(),
     ));
 
+    // Preflight: check that Docker is available for the local provider
+    if config
+        .providers
+        .local
+        .as_ref()
+        .map_or(true, |l| l.enabled)
+    {
+        tracing::info!("running Docker preflight check");
+        bridge.preflight("local").await?;
+        tracing::info!("Docker preflight check passed");
+    }
+
     // Start dispatcher
     let dispatcher = Arc::new(dispatcher::Dispatcher::new(
         store.clone(),

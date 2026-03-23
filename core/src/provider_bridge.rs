@@ -116,6 +116,15 @@ impl ProviderBridge {
         Ok(())
     }
 
+    pub async fn preflight(&self, provider: &str) -> anyhow::Result<()> {
+        let cmd = serde_json::json!({
+            "method": "preflight",
+            "provider": provider,
+        });
+        self.call(cmd).await?;
+        Ok(())
+    }
+
     pub async fn capabilities(&self, provider: &str) -> anyhow::Result<serde_json::Value> {
         let cmd = serde_json::json!({
             "method": "capabilities",

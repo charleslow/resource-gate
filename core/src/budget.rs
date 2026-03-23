@@ -14,8 +14,13 @@ impl BudgetEnforcer {
     }
 
     /// Check if a new proposal with the given budget cap can be accepted
-    /// without exceeding the daily limit.
+    /// without exceeding the daily limit. A daily_limit_usd of 0 means unlimited.
     pub fn can_accept(&self, budget_cap_usd: f64) -> anyhow::Result<BudgetCheck> {
+        // 0 means unlimited — always accept
+        if self.config.daily_limit_usd <= 0.0 {
+            return Ok(BudgetCheck::Accepted);
+        }
+
         let daily_spent = self.store.daily_spend()?;
         let remaining = self.config.daily_limit_usd - daily_spent;
 
