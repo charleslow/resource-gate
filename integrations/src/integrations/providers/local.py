@@ -8,6 +8,7 @@ cancel() → docker kill
 import asyncio
 import json
 import time
+from datetime import datetime
 
 from .interface import (
     JobHandle,
@@ -28,6 +29,15 @@ async def _run(cmd: list[str]) -> tuple[int, str, str]:
     )
     stdout, stderr = await proc.communicate()
     return proc.returncode, stdout.decode().strip(), stderr.decode().strip()
+
+
+def _parse_docker_ts(ts: str, fallback: float) -> float:
+    """Parse Docker's RFC3339Nano timestamp to epoch seconds."""
+    try:
+        # Docker uses Go's time format: 2024-01-15T10:30:00.123456789Z
+        return datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp()
+    except (ValueError, AttributeError):
+        return fallback
 
 
 class LocalProvider:
@@ -115,34 +125,47 @@ class LocalProvider:
         )
 
         if rc != 0:
-            # Container gone (--rm cleaned it up, or was killed)
-            # Treat as completed if we can't find it — the dispatcher
-            # will have already recorded the kill if it initiated one.
+            # Container gone (--rm cleaned it up after a crash, or was removed).
+            # Report FAILED — if the dispatcher initiated a kill it already knows,
+            # but a silent crash + --rm cleanup must not look like success.
             return JobResult(
-                status=JobStatus.COMPLETED,
+                status=JobStatus.FAILED,
                 started_at=handle.launched_at,
                 ended_at=time.time(),
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
-                error=None,
+                error="container not found — may have been removed by --rm after a crash",
                 artifacts_path="/workspace",
             )
 
         state = json.loads(stdout)
         status = state.get("Status", "")
 
-        if status == "running":
+        # Handle non-terminal Docker states explicitly
+        if status in ("running", "created", "paused", "restarting"):
             return JobStatus.RUNNING
 
-        # Container exited
+        if status == "dead":
+            return JobResult(
+                status=JobStatus.FAILED,
+                started_at=handle.launched_at,
+                ended_at=time.time(),
+                gpu_seconds=time.time() - handle.launched_at,
+                result_payload=None,
+                error="container entered 'dead' state — Docker daemon error",
+                artifacts_path="/workspace",
+            )
+
+        # Container exited — use Docker's actual timestamps
         exit_code = state.get("ExitCode", -1)
-        finished_at_str = state.get("FinishedAt", "")
+        oom_killed = state.get("OOMKilled", False)
         started_at_str = state.get("StartedAt", "")
+        finished_at_str = state.get("FinishedAt", "")
 
-        ended_at = time.time()
-        started_at = handle.launched_at
+        started_at = _parse_docker_ts(started_at_str, handle.launched_at)
+        ended_at = _parse_docker_ts(finished_at_str, time.time())
 
-        if exit_code == 0:
+        if exit_code == 0 and not oom_killed:
             return JobResult(
                 status=JobStatus.COMPLETED,
                 started_at=started_at,
@@ -153,17 +176,22 @@ class LocalProvider:
                 artifacts_path="/workspace",
             )
         else:
-            # Try to get last few lines of logs for error context
+            # Get logs for error context
             _, logs, _ = await _run(
                 ["docker", "logs", "--tail", "20", container_id]
             )
+            if oom_killed:
+                error_msg = f"OOM killed (exit code {exit_code}): container exceeded memory limit"
+            else:
+                error_msg = f"exit code {exit_code}: {logs[-500:] if logs else 'no output'}"
+
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=started_at,
                 ended_at=ended_at,
                 gpu_seconds=ended_at - started_at,
-                result_payload={"exit_code": exit_code},
-                error=f"exit code {exit_code}: {logs[-500:] if logs else 'no output'}",
+                result_payload={"exit_code": exit_code, "oom_killed": oom_killed},
+                error=error_msg,
                 artifacts_path="/workspace",
             )
 
