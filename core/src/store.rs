@@ -27,6 +27,17 @@ fn now() -> f64 {
 }
 
 impl Store {
+    /// Create an in-memory store for testing.
+    #[cfg(test)]
+    pub fn new_in_memory() -> anyhow::Result<Self> {
+        let conn = Connection::open_in_memory()?;
+        let store = Store {
+            conn: Arc::new(Mutex::new(conn)),
+        };
+        store.migrate()?;
+        Ok(store)
+    }
+
     pub fn open(path: &Path) -> anyhow::Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -151,7 +162,7 @@ impl Store {
         if let Some(status) = status_filter {
             let mut stmt = conn.prepare(
                 "SELECT id, status, sprint_name, description, provider_name,
-                        resource_request, budget_cap_usd, estimated_minutes, tags,
+                        resource_request, config, budget_cap_usd, estimated_minutes, tags,
                         provider_job_id, created_at, approved_at, dispatched_at,
                         started_at, ended_at, result_payload, error, kill_reason
                  FROM proposals WHERE status = ?1 ORDER BY created_at DESC",
@@ -163,7 +174,7 @@ impl Store {
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, status, sprint_name, description, provider_name,
-                        resource_request, budget_cap_usd, estimated_minutes, tags,
+                        resource_request, config, budget_cap_usd, estimated_minutes, tags,
                         provider_job_id, created_at, approved_at, dispatched_at,
                         started_at, ended_at, result_payload, error, kill_reason
                  FROM proposals ORDER BY created_at DESC",
