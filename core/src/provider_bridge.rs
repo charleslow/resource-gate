@@ -116,6 +116,20 @@ impl ProviderBridge {
         Ok(())
     }
 
+    /// Block until the container exits.  Returns the exit code.
+    /// Used by the dispatcher's background wait task for fast completion
+    /// detection (instead of waiting for the next 30 s poll cycle).
+    pub async fn wait_for_exit(&self, provider: &str, handle: &JobHandle) -> anyhow::Result<i64> {
+        let cmd = serde_json::json!({
+            "method": "wait",
+            "provider": provider,
+            "handle": handle,
+        });
+        let resp = self.call(cmd).await?;
+        let exit_code = resp["data"]["exit_code"].as_i64().unwrap_or(-1);
+        Ok(exit_code)
+    }
+
     pub async fn preflight(&self, provider: &str) -> anyhow::Result<()> {
         let cmd = serde_json::json!({
             "method": "preflight",

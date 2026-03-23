@@ -84,6 +84,11 @@ async def handle_command(cmd: dict) -> dict:
         await provider.cancel(handle)
         return {"type": "ok", "data": None}
 
+    elif method == "wait":
+        handle = JobHandle(**cmd["handle"])
+        exit_code = await provider.wait_for_exit(handle)
+        return {"type": "wait_result", "data": {"exit_code": exit_code}}
+
     elif method == "get_artifacts":
         handle = JobHandle(**cmd["handle"])
         local_dest = cmd["local_dest"]
