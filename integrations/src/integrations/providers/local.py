@@ -3,7 +3,6 @@
 launch() → docker run (detached) with resource limits and shared workspace
 poll()   → docker inspect to check container status
 cancel() → docker kill
-wait_for_exit() → docker wait (blocks until container exits)
 
 Note: Containers are NOT launched with --rm.  We need to inspect them after
 exit to read exit code / OOM status, so auto-removal would race with the
@@ -211,24 +210,6 @@ class LocalProvider:
         container_id = handle.provider_job_id
         await _run(["docker", "kill", container_id])
         await _run(["docker", "rm", "-f", container_id])
-
-    async def wait_for_exit(self, handle: JobHandle) -> int:
-        """Block until the container exits, return exit code.
-
-        This is used by the dispatcher to get near-instant notification of
-        job completion instead of waiting for the next poll interval.
-        ``docker wait`` blocks until the container stops and prints the
-        exit code.  If the container is already stopped it returns
-        immediately.
-        """
-        container_id = handle.provider_job_id
-        rc, stdout, stderr = await _run(["docker", "wait", container_id])
-        if rc != 0:
-            return -1
-        try:
-            return int(stdout.strip())
-        except ValueError:
-            return -1
 
     async def get_artifacts(self, handle: JobHandle, local_dest: str) -> None:
         """No-op — workspace is already a shared volume on the host."""

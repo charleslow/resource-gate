@@ -4,7 +4,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::Notify;
 use tokio::time::{interval, Duration};
 
 use crate::budget::BudgetEnforcer;
@@ -18,10 +17,6 @@ pub struct Dispatcher {
     bridge: Arc<ProviderBridge>,
     poll_interval: Duration,
     paused: Arc<AtomicBool>,
-    /// Notified when a background `docker wait` detects a container exit,
-    /// so the dispatcher can poll immediately instead of waiting for the
-    /// next tick.
-    job_exited: Arc<Notify>,
 }
 
 impl Dispatcher {
@@ -37,7 +32,6 @@ impl Dispatcher {
             bridge,
             poll_interval: Duration::from_secs(poll_interval_secs),
             paused: Arc::new(AtomicBool::new(false)),
-            job_exited: Arc::new(Notify::new()),
         }
     }
 
@@ -57,14 +51,7 @@ impl Dispatcher {
         );
 
         loop {
-            // Wake on either the regular interval OR when a background
-            // `docker wait` signals that a container has exited.
-            tokio::select! {
-                _ = ticker.tick() => {},
-                _ = self.job_exited.notified() => {
-                    tracing::debug!("woken by docker-wait: container exited");
-                },
-            }
+            ticker.tick().await;
 
             if self.paused.load(Ordering::Relaxed) {
                 continue;
@@ -99,35 +86,6 @@ impl Dispatcher {
                         proposal.id,
                         handle.provider_job_id
                     );
-
-                    // Spawn a background task that blocks on `docker wait`
-                    // and wakes the dispatcher the instant the container
-                    // exits, avoiding a full poll-interval delay.
-                    let bridge = Arc::clone(&self.bridge);
-                    let notify = Arc::clone(&self.job_exited);
-                    let provider = proposal.provider_name.clone();
-                    let wait_handle = handle.clone();
-                    let proposal_id = proposal.id.clone();
-                    tokio::spawn(async move {
-                        match bridge.wait_for_exit(&provider, &wait_handle).await {
-                            Ok(code) => {
-                                tracing::info!(
-                                    "docker-wait: proposal {} exited with code {}",
-                                    proposal_id,
-                                    code,
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    "docker-wait failed for proposal {}: {}",
-                                    proposal_id,
-                                    e,
-                                );
-                            }
-                        }
-                        // Wake the dispatcher to poll immediately
-                        notify.notify_one();
-                    });
                 }
                 Err(e) => {
                     tracing::error!("failed to launch proposal {}: {}", proposal.id, e);
