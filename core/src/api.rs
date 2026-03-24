@@ -19,7 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::budget::{BudgetCheck, BudgetEnforcer};
+use crate::budget::{BudgetEnforcer, LeaseTimeCheck};
 use crate::models::*;
 use crate::provider_bridge::ProviderBridge;
 use crate::store::Store;
@@ -32,6 +32,7 @@ pub struct AppState {
     pub paused: Arc<AtomicBool>,
     pub agent_token: Option<String>,
     pub admin_token: Option<String>,
+    pub concurrency_limits: std::collections::HashMap<String, u32>,
 }
 
 /// Extract bearer token from Authorization header.
@@ -108,6 +109,9 @@ pub fn router(state: AppState) -> Router {
         .route("/proposals", get(list_proposals))
         .route("/proposals/{id}", get(get_proposal))
         .route("/proposals/{id}/complete", post(complete_proposal))
+        .route("/leases", post(create_lease))
+        .route("/leases", get(list_leases))
+        .route("/leases/{id}", get(get_lease))
         .route("/budget", get(get_budget))
         .route("/providers", get(list_providers))
         .route("/system/status", get(system_status))
@@ -121,6 +125,8 @@ pub fn router(state: AppState) -> Router {
         .route("/proposals/{id}/approve", post(approve_proposal))
         .route("/proposals/{id}/reject", post(reject_proposal))
         .route("/proposals/{id}", delete(cancel_proposal))
+        .route("/leases/{id}/approve", post(approve_lease))
+        .route("/leases/{id}/reject", post(reject_lease))
         .route("/system/pause", post(system_pause))
         .route("/system/resume", post(system_resume))
         .route("/system/kill-all", post(kill_all))
@@ -138,9 +144,14 @@ async fn create_proposal(
     State(state): State<AppState>,
     Json(req): Json<CreateProposalRequest>,
 ) -> impl IntoResponse {
-    // Budget check
-    match state.budget.can_accept(req.budget_cap_usd) {
-        Ok(BudgetCheck::Rejected { reason }) => {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    // Lease validation
+    match state.budget.lease_has_time(&req.lease_id, now) {
+        Ok(LeaseTimeCheck::Rejected { reason }) => {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({"error": reason})),
@@ -154,13 +165,43 @@ async fn create_proposal(
             )
                 .into_response();
         }
-        Ok(BudgetCheck::Accepted) => {}
+        Ok(LeaseTimeCheck::Accepted { .. }) => {}
     }
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs_f64();
+    // Verify lease provider matches proposal provider
+    if let Ok(Some(lease)) = state.store.get_lease(&req.lease_id) {
+        if lease.provider_name != req.provider {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("lease provider '{}' does not match proposal provider '{}'", lease.provider_name, req.provider)
+                })),
+            )
+                .into_response();
+        }
+    }
+
+    // Concurrency check
+    let max_concurrent = state.concurrency_limits.get(&req.provider).copied().unwrap_or(4);
+    match state.store.count_running_jobs_for_provider(&req.provider) {
+        Ok(running) if running >= max_concurrent => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "error": format!("provider '{}' at concurrency limit ({}/{})", req.provider, running, max_concurrent)
+                })),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+        _ => {}
+    }
 
     let id = format!("prop_{}", ulid::Ulid::new());
 
@@ -184,6 +225,9 @@ async fn create_proposal(
         result_payload: None,
         error: None,
         kill_reason: None,
+        lease_id: Some(req.lease_id),
+        runtime_seconds: None,
+        lease_remaining_at_start: None,
     };
 
     match state.store.insert_proposal(&proposal) {
@@ -394,6 +438,188 @@ async fn cancel_proposal(
             Json(serde_json::json!({"error": "not found"})),
         )
             .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// -- Leases --
+
+async fn create_lease(
+    State(state): State<AppState>,
+    Json(req): Json<CreateLeaseRequest>,
+) -> impl IntoResponse {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    let id = format!("lease_{}", ulid::Ulid::new());
+
+    let lease = Lease {
+        id: id.clone(),
+        status: LeaseStatus::Pending,
+        provider_name: req.provider,
+        duration_seconds: req.duration_seconds,
+        created_at: now,
+        approved_at: None,
+        rejected_at: None,
+        expired_at: None,
+    };
+
+    match state.store.insert_lease(&lease) {
+        Ok(()) => (
+            StatusCode::CREATED,
+            Json(serde_json::json!({
+                "lease_id": id,
+                "status": "pending"
+            })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn get_lease(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs_f64();
+
+    match state.store.get_lease(&id) {
+        Ok(Some(lease)) => {
+            let time_used = state
+                .store
+                .cumulative_runtime_for_lease(&id, now)
+                .unwrap_or(0.0);
+            let time_remaining = (lease.duration_seconds as f64 - time_used).max(0.0);
+            let jobs = state
+                .store
+                .list_proposals_for_lease(&id)
+                .unwrap_or_default();
+
+            let response = LeaseResponse {
+                id: lease.id,
+                status: lease.status,
+                provider_name: lease.provider_name,
+                duration_seconds: lease.duration_seconds,
+                created_at: lease.created_at,
+                approved_at: lease.approved_at,
+                rejected_at: lease.rejected_at,
+                expired_at: lease.expired_at,
+                time_used_seconds: time_used,
+                time_remaining_seconds: time_remaining,
+                jobs,
+            };
+            Json(serde_json::to_value(response).unwrap()).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn list_leases(
+    State(state): State<AppState>,
+    Query(query): Query<ListQuery>,
+) -> impl IntoResponse {
+    match state.store.list_leases(query.status.as_deref()) {
+        Ok(leases) => Json(serde_json::json!({"leases": leases})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn approve_lease(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_lease(&id) {
+        Ok(Some(l)) if l.status == LeaseStatus::Pending => {}
+        Ok(Some(l)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("lease is {}, not pending", l.status)})),
+            )
+                .into_response();
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.approve_lease(&id) {
+        Ok(()) => Json(serde_json::json!({"status": "approved"})).into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn reject_lease(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    match state.store.get_lease(&id) {
+        Ok(Some(l)) if l.status == LeaseStatus::Pending => {}
+        Ok(Some(l)) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": format!("lease is {}, not pending", l.status)})),
+            )
+                .into_response();
+        }
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "not found"})),
+            )
+                .into_response();
+        }
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": e.to_string()})),
+            )
+                .into_response();
+        }
+    }
+
+    match state.store.reject_lease(&id) {
+        Ok(()) => Json(serde_json::json!({"status": "rejected"})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),

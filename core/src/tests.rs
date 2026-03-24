@@ -49,6 +49,22 @@ fn test_proposal(id: &str) -> Proposal {
         result_payload: None,
         error: None,
         kill_reason: None,
+        lease_id: None,
+        runtime_seconds: None,
+        lease_remaining_at_start: None,
+    }
+}
+
+fn test_lease(id: &str, provider: &str, duration_seconds: u64) -> Lease {
+    Lease {
+        id: id.to_string(),
+        status: LeaseStatus::Pending,
+        provider_name: provider.to_string(),
+        duration_seconds,
+        created_at: 1000.0,
+        approved_at: None,
+        rejected_at: None,
+        expired_at: None,
     }
 }
 
@@ -68,6 +84,8 @@ fn test_app_state(store: Store) -> AppState {
         "/dev/null".into(),
         "/tmp".into(),
     ));
+    let mut concurrency_limits = std::collections::HashMap::new();
+    concurrency_limits.insert("local".to_string(), 1);
     AppState {
         store,
         budget,
@@ -75,6 +93,7 @@ fn test_app_state(store: Store) -> AppState {
         paused: Arc::new(AtomicBool::new(false)),
         agent_token: Some("agent-secret".into()),
         admin_token: Some("admin-secret".into()),
+        concurrency_limits,
     }
 }
 
@@ -311,6 +330,12 @@ async fn test_unauthenticated_rejected() {
 #[tokio::test]
 async fn test_agent_can_submit_proposal() {
     let store = test_store();
+
+    // Create and approve a lease first
+    let lease = test_lease("lease-1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("lease-1").unwrap();
+
     let state = test_app_state(store);
     let app = crate::api::router(state);
 
@@ -319,7 +344,7 @@ async fn test_agent_can_submit_proposal() {
         "description": "test sprint",
         "provider": "local",
         "resource_request": {"gpu": "cpu-only", "gpu_count": 1},
-        "budget_cap_usd": 5.0
+        "lease_id": "lease-1"
     });
 
     let resp = app
@@ -522,4 +547,318 @@ async fn test_kill_all_with_no_running_still_pauses() {
     let json = body_json(resp.into_body()).await;
     assert_eq!(json["killed"], 0);
     assert!(paused.load(Ordering::Relaxed));
+}
+
+// ===========================================================================
+// 6. Lease lifecycle (store layer)
+// ===========================================================================
+
+#[tokio::test]
+async fn test_lease_lifecycle_happy_path() {
+    let store = test_store();
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+
+    // Pending -> Approved
+    store.approve_lease("l1").unwrap();
+    let l = store.get_lease("l1").unwrap().unwrap();
+    assert_eq!(l.status, LeaseStatus::Approved);
+    assert!(l.approved_at.is_some());
+
+    // Approved -> Expired
+    store.expire_lease("l1").unwrap();
+    let l = store.get_lease("l1").unwrap().unwrap();
+    assert_eq!(l.status, LeaseStatus::Expired);
+    assert!(l.expired_at.is_some());
+}
+
+#[tokio::test]
+async fn test_lease_rejection() {
+    let store = test_store();
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+
+    store.reject_lease("l1").unwrap();
+    let l = store.get_lease("l1").unwrap().unwrap();
+    assert_eq!(l.status, LeaseStatus::Rejected);
+    assert!(l.rejected_at.is_some());
+}
+
+#[tokio::test]
+async fn test_lease_approve_only_works_on_pending() {
+    let store = test_store();
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Try to approve again — should be no-op
+    store.approve_lease("l1").unwrap();
+    let l = store.get_lease("l1").unwrap().unwrap();
+    assert_eq!(l.status, LeaseStatus::Approved);
+}
+
+#[tokio::test]
+async fn test_cumulative_runtime_for_lease() {
+    let store = test_store();
+
+    // Create and approve lease
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Create two completed proposals under the lease
+    let mut p1 = test_proposal("p1");
+    p1.lease_id = Some("l1".into());
+    p1.status = ProposalStatus::Completed;
+    p1.started_at = Some(1000.0);
+    p1.ended_at = Some(1060.0); // 60s
+    store.insert_proposal(&p1).unwrap();
+
+    let mut p2 = test_proposal("p2");
+    p2.lease_id = Some("l1".into());
+    p2.status = ProposalStatus::Completed;
+    p2.started_at = Some(1100.0);
+    p2.ended_at = Some(1130.0); // 30s
+    store.insert_proposal(&p2).unwrap();
+
+    let runtime = store.cumulative_runtime_for_lease("l1", 2000.0).unwrap();
+    assert!((runtime - 90.0).abs() < 0.01, "expected 90s, got {}", runtime);
+}
+
+#[tokio::test]
+async fn test_cumulative_runtime_includes_running_jobs() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+
+    // A running job started at 1000, "now" is 1050 → 50s in progress
+    let mut p1 = test_proposal("p1");
+    p1.lease_id = Some("l1".into());
+    p1.status = ProposalStatus::Running;
+    p1.started_at = Some(1000.0);
+    store.insert_proposal(&p1).unwrap();
+
+    let runtime = store.cumulative_runtime_for_lease("l1", 1050.0).unwrap();
+    assert!((runtime - 50.0).abs() < 0.01, "expected 50s, got {}", runtime);
+}
+
+#[tokio::test]
+async fn test_count_running_jobs_for_provider() {
+    let store = test_store();
+
+    let mut p1 = test_proposal("p1");
+    p1.status = ProposalStatus::Running;
+    store.insert_proposal(&p1).unwrap();
+
+    let mut p2 = test_proposal("p2");
+    p2.status = ProposalStatus::Running;
+    store.insert_proposal(&p2).unwrap();
+
+    let mut p3 = test_proposal("p3");
+    p3.status = ProposalStatus::Completed;
+    store.insert_proposal(&p3).unwrap();
+
+    let count = store.count_running_jobs_for_provider("local").unwrap();
+    assert_eq!(count, 2);
+}
+
+#[tokio::test]
+async fn test_proposal_rejected_without_lease() {
+    let store = test_store();
+    let state = test_app_state(store);
+    let app = crate::api::router(state);
+
+    // Submit proposal with non-existent lease
+    let body = serde_json::json!({
+        "sprint_name": "test",
+        "description": "test sprint",
+        "provider": "local",
+        "resource_request": {"gpu": "cpu-only", "gpu_count": 1},
+        "lease_id": "nonexistent"
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proposals")
+                .header("authorization", "Bearer agent-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_proposal_rejected_on_expired_lease() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+    store.expire_lease("l1").unwrap();
+
+    let state = test_app_state(store);
+    let app = crate::api::router(state);
+
+    let body = serde_json::json!({
+        "sprint_name": "test",
+        "description": "test sprint",
+        "provider": "local",
+        "resource_request": {"gpu": "cpu-only", "gpu_count": 1},
+        "lease_id": "l1"
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proposals")
+                .header("authorization", "Bearer agent-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_lease_api_create_and_approve() {
+    let store = test_store();
+    let state = test_app_state(store.clone());
+    let app = crate::api::router(state);
+
+    // Create lease
+    let body = serde_json::json!({
+        "provider": "local",
+        "duration_seconds": 600
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/leases")
+                .header("authorization", "Bearer agent-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let json = body_json(resp.into_body()).await;
+    let lease_id = json["lease_id"].as_str().unwrap().to_string();
+
+    // Approve lease (need a new app instance since oneshot consumes it)
+    let state2 = test_app_state(store.clone());
+    let app2 = crate::api::router(state2);
+
+    let resp = app2
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(&format!("/leases/{}/approve", lease_id))
+                .header("authorization", "Bearer admin-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let lease = store.get_lease(&lease_id).unwrap().unwrap();
+    assert_eq!(lease.status, LeaseStatus::Approved);
+}
+
+#[tokio::test]
+async fn test_get_lease_returns_enriched_response() {
+    let store = test_store();
+
+    // Create and approve lease
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Add a completed job
+    let mut p1 = test_proposal("p1");
+    p1.lease_id = Some("l1".into());
+    p1.status = ProposalStatus::Completed;
+    p1.started_at = Some(1000.0);
+    p1.ended_at = Some(1060.0);
+    store.insert_proposal(&p1).unwrap();
+
+    let state = test_app_state(store);
+    let app = crate::api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/leases/l1")
+                .header("authorization", "Bearer agent-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::OK);
+    let json = body_json(resp.into_body()).await;
+    assert_eq!(json["id"], "l1");
+    assert_eq!(json["duration_seconds"], 600);
+    assert!(json["time_used_seconds"].as_f64().unwrap() >= 60.0);
+    assert!(json["time_remaining_seconds"].as_f64().unwrap() <= 540.0);
+    assert_eq!(json["jobs"].as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn test_kill_proposal_lease_exceeded() {
+    let store = test_store();
+    let mut p = test_proposal("p1");
+    p.status = ProposalStatus::Running;
+    p.started_at = Some(1000.0);
+    p.lease_id = Some("l1".into());
+    store.insert_proposal(&p).unwrap();
+
+    store.kill_proposal_lease_exceeded("p1", 123.0, 60.0).unwrap();
+    let p = store.get_proposal("p1").unwrap().unwrap();
+    assert_eq!(p.status, ProposalStatus::Killed);
+    assert_eq!(p.kill_reason.as_deref(), Some("lease_time_exceeded"));
+    assert!((p.runtime_seconds.unwrap() - 123.0).abs() < 0.01);
+    assert!((p.lease_remaining_at_start.unwrap() - 60.0).abs() < 0.01);
+}
+
+#[tokio::test]
+async fn test_agent_cannot_approve_lease() {
+    let store = test_store();
+    let lease = test_lease("l1", "local", 600);
+    store.insert_lease(&lease).unwrap();
+
+    let state = test_app_state(store);
+    let app = crate::api::router(state);
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/leases/l1/approve")
+                .header("authorization", "Bearer agent-secret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 }

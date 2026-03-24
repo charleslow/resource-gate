@@ -1,6 +1,69 @@
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// ---------------------------------------------------------------------------
+// Lease types
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum LeaseStatus {
+    Pending,
+    Approved,
+    Expired,
+    Rejected,
+}
+
+impl fmt::Display for LeaseStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Pending => write!(f, "pending"),
+            Self::Approved => write!(f, "approved"),
+            Self::Expired => write!(f, "expired"),
+            Self::Rejected => write!(f, "rejected"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Lease {
+    pub id: String,
+    pub status: LeaseStatus,
+    pub provider_name: String,
+    pub duration_seconds: u64,
+    pub created_at: f64,
+    pub approved_at: Option<f64>,
+    pub rejected_at: Option<f64>,
+    pub expired_at: Option<f64>,
+}
+
+/// Request body for POST /leases
+#[derive(Debug, Deserialize)]
+pub struct CreateLeaseRequest {
+    pub provider: String,
+    pub duration_seconds: u64,
+}
+
+/// Enriched response for GET /leases/{id}
+#[derive(Debug, Serialize)]
+pub struct LeaseResponse {
+    pub id: String,
+    pub status: LeaseStatus,
+    pub provider_name: String,
+    pub duration_seconds: u64,
+    pub created_at: f64,
+    pub approved_at: Option<f64>,
+    pub rejected_at: Option<f64>,
+    pub expired_at: Option<f64>,
+    pub time_used_seconds: f64,
+    pub time_remaining_seconds: f64,
+    pub jobs: Vec<Proposal>,
+}
+
+// ---------------------------------------------------------------------------
+// Proposal types
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProposalStatus {
@@ -70,6 +133,9 @@ pub struct Proposal {
     pub result_payload: Option<serde_json::Value>,
     pub error: Option<String>,
     pub kill_reason: Option<String>,
+    pub lease_id: Option<String>,
+    pub runtime_seconds: Option<f64>,
+    pub lease_remaining_at_start: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,9 +180,12 @@ pub struct CreateProposalRequest {
     #[serde(default)]
     pub config: serde_json::Value,
     pub estimated_minutes: Option<u32>,
+    #[serde(default)]
     pub budget_cap_usd: f64,
     #[serde(default)]
     pub tags: serde_json::Value,
+    /// Lease this job belongs to (required for time-based budget enforcement)
+    pub lease_id: String,
 }
 
 /// Request body for POST /proposals/{id}/complete

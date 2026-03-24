@@ -17,6 +17,7 @@ pub struct Dispatcher {
     bridge: Arc<ProviderBridge>,
     poll_interval: Duration,
     paused: Arc<AtomicBool>,
+    concurrency_limits: std::collections::HashMap<String, u32>,
 }
 
 impl Dispatcher {
@@ -25,6 +26,7 @@ impl Dispatcher {
         budget: Arc<BudgetEnforcer>,
         bridge: Arc<ProviderBridge>,
         poll_interval_secs: u64,
+        concurrency_limits: std::collections::HashMap<String, u32>,
     ) -> Self {
         Self {
             store,
@@ -32,6 +34,7 @@ impl Dispatcher {
             bridge,
             poll_interval: Duration::from_secs(poll_interval_secs),
             paused: Arc::new(AtomicBool::new(false)),
+            concurrency_limits,
         }
     }
 
@@ -81,8 +84,64 @@ impl Dispatcher {
 
     async fn dispatch_approved(&self) -> anyhow::Result<()> {
         let approved = self.store.list_proposals(Some("approved"))?;
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
 
         for proposal in approved {
+            // Concurrency check
+            let max_concurrent = self
+                .concurrency_limits
+                .get(&proposal.provider_name)
+                .copied()
+                .unwrap_or(4);
+            let running_count = self
+                .store
+                .count_running_jobs_for_provider(&proposal.provider_name)?;
+            if running_count >= max_concurrent {
+                tracing::debug!(
+                    "skipping proposal {} — provider '{}' at concurrency limit ({}/{})",
+                    proposal.id,
+                    proposal.provider_name,
+                    running_count,
+                    max_concurrent
+                );
+                continue; // stay approved, retry next tick
+            }
+
+            // Lease time check
+            if let Some(ref lease_id) = proposal.lease_id {
+                let used = self.store.cumulative_runtime_for_lease(lease_id, now)?;
+                if let Ok(Some(lease)) = self.store.get_lease(lease_id) {
+                    if lease.status != crate::models::LeaseStatus::Approved {
+                        tracing::warn!(
+                            "failing proposal {} — lease {} is {}",
+                            proposal.id,
+                            lease_id,
+                            lease.status
+                        );
+                        self.store.fail_proposal(
+                            &proposal.id,
+                            &format!("lease {} is {}", lease_id, lease.status),
+                        )?;
+                        continue;
+                    }
+                    if used >= lease.duration_seconds as f64 {
+                        tracing::warn!(
+                            "failing proposal {} — lease {} has no time remaining",
+                            proposal.id,
+                            lease_id
+                        );
+                        self.store.fail_proposal(
+                            &proposal.id,
+                            &format!("lease {} exhausted ({:.0}s used of {}s)", lease_id, used, lease.duration_seconds),
+                        )?;
+                        continue;
+                    }
+                }
+            }
+
             tracing::info!("dispatching proposal {}: {}", proposal.id, proposal.sprint_name);
 
             match self.bridge.launch(&proposal.provider_name, &proposal.resource_request, &proposal.config).await {
@@ -108,28 +167,108 @@ impl Dispatcher {
     async fn monitor_running(&self) -> anyhow::Result<()> {
         let running = self.store.list_proposals(Some("running"))?;
 
-        for proposal in running {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Group by lease_id to check lease budgets once per lease
+        let mut lease_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for proposal in &running {
+            if let Some(ref lease_id) = proposal.lease_id {
+                if !lease_checked.contains(lease_id) {
+                    lease_checked.insert(lease_id.clone());
+
+                    if let Ok(Some(lease)) = self.store.get_lease(lease_id) {
+                        let cumulative = self
+                            .store
+                            .cumulative_runtime_for_lease(lease_id, now)
+                            .unwrap_or(0.0);
+
+                        if cumulative >= lease.duration_seconds as f64 {
+                            tracing::warn!(
+                                "lease {} exhausted ({:.0}s / {}s) — killing all jobs",
+                                lease_id,
+                                cumulative,
+                                lease.duration_seconds
+                            );
+
+                            // Kill all running jobs in this lease
+                            for p in &running {
+                                if p.lease_id.as_deref() == Some(lease_id) {
+                                    let job_runtime = now - p.started_at.unwrap_or(now);
+                                    let remaining_at_start =
+                                        lease.duration_seconds as f64 - (cumulative - job_runtime);
+
+                                    // Cancel via provider
+                                    if let Some(ref job_id) = p.provider_job_id {
+                                        let handle = JobHandle {
+                                            provider_name: p.provider_name.clone(),
+                                            provider_job_id: job_id.clone(),
+                                            launched_at: p.dispatched_at.unwrap_or(0.0),
+                                        };
+                                        if let Err(e) =
+                                            self.bridge.cancel(&p.provider_name, &handle).await
+                                        {
+                                            tracing::error!(
+                                                "cancel error for proposal {}: {}",
+                                                p.id,
+                                                e
+                                            );
+                                        }
+                                    }
+
+                                    if let Err(e) = self.store.kill_proposal_lease_exceeded(
+                                        &p.id,
+                                        job_runtime,
+                                        remaining_at_start,
+                                    ) {
+                                        tracing::error!(
+                                            "failed to kill proposal {} for lease expiry: {}",
+                                            p.id,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+
+                            // Expire the lease
+                            if let Err(e) = self.store.expire_lease(lease_id) {
+                                tracing::error!("failed to expire lease {}: {}", lease_id, e);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Now handle per-proposal checks (timeout, polling) for proposals not already killed
+        for proposal in &running {
+            // Skip if already killed by lease expiry above
+            if let Some(ref lease_id) = proposal.lease_id {
+                if lease_checked.contains(lease_id) {
+                    // Re-check if this proposal was killed
+                    if let Ok(Some(p)) = self.store.get_proposal(&proposal.id) {
+                        if p.status == ProposalStatus::Killed {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             let started_at = match proposal.started_at {
                 Some(t) => t,
                 None => continue,
             };
 
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs_f64();
-
-            // Check timeout
+            // Check per-proposal timeout
             let elapsed = now - started_at;
             if elapsed >= proposal.resource_request.timeout_seconds as f64 {
                 tracing::warn!("proposal {} timed out after {:.0}s", proposal.id, elapsed);
-                self.cancel_and_kill(&proposal, "timeout_exceeded").await;
+                self.cancel_and_kill(proposal, "timeout_exceeded").await;
                 continue;
             }
-
-            // Check per-sprint budget (for providers with non-zero rates)
-            // Local provider has rate 0.0, so this is a no-op for local
-            // For future providers, this would compute cost and kill if exceeded
 
             // Poll the provider for status
             if let Some(ref job_id) = proposal.provider_job_id {
@@ -143,7 +282,7 @@ impl Dispatcher {
                     Ok(ProviderResponse::Result(result)) => {
                         if result.status == "completed" {
                             self.store.complete_proposal(&proposal.id, None)?;
-                            self.record_cost(&proposal, result.gpu_seconds)?;
+                            self.record_cost(proposal, result.gpu_seconds)?;
                         } else if result.status == "failed" {
                             self.store.fail_proposal(
                                 &proposal.id,
@@ -152,7 +291,6 @@ impl Dispatcher {
                         }
                     }
                     Ok(ProviderResponse::Status(status)) => {
-                        // Still running, nothing to do
                         tracing::trace!("proposal {} status: {}", proposal.id, status);
                     }
                     Ok(_) => {}
