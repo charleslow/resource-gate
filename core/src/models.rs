@@ -30,6 +30,7 @@ pub struct Lease {
     pub id: String,
     pub status: LeaseStatus,
     pub provider_name: String,
+    pub gpu: String,
     pub duration_seconds: u64,
     pub created_at: f64,
     pub approved_at: Option<f64>,
@@ -41,6 +42,7 @@ pub struct Lease {
 #[derive(Debug, Deserialize)]
 pub struct CreateLeaseRequest {
     pub provider: String,
+    pub gpu: String,
     pub duration_seconds: u64,
 }
 
@@ -50,6 +52,7 @@ pub struct LeaseResponse {
     pub id: String,
     pub status: LeaseStatus,
     pub provider_name: String,
+    pub gpu: String,
     pub duration_seconds: u64,
     pub created_at: f64,
     pub approved_at: Option<f64>,

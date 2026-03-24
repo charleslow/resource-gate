@@ -103,6 +103,7 @@ impl Store {
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
+                gpu TEXT NOT NULL DEFAULT 'cpu-only',
                 duration_seconds INTEGER NOT NULL,
                 created_at REAL NOT NULL,
                 approved_at REAL,
@@ -117,6 +118,7 @@ impl Store {
             "ALTER TABLE proposals ADD COLUMN lease_id TEXT",
             "ALTER TABLE proposals ADD COLUMN runtime_seconds REAL",
             "ALTER TABLE proposals ADD COLUMN lease_remaining_at_start REAL",
+            "ALTER TABLE leases ADD COLUMN gpu TEXT NOT NULL DEFAULT 'cpu-only'",
         ];
         for stmt in &alter_statements {
             // Ignore "duplicate column" errors
@@ -333,12 +335,13 @@ impl Store {
     pub fn insert_lease(&self, lease: &Lease) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO leases (id, status, provider_name, duration_seconds, created_at, approved_at, rejected_at, expired_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO leases (id, status, provider_name, gpu, duration_seconds, created_at, approved_at, rejected_at, expired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 lease.id,
                 lease.status.to_string(),
                 lease.provider_name,
+                lease.gpu,
                 lease.duration_seconds,
                 lease.created_at,
                 lease.approved_at,
@@ -352,7 +355,7 @@ impl Store {
     pub fn get_lease(&self, id: &str) -> anyhow::Result<Option<Lease>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
-            "SELECT id, status, provider_name, duration_seconds, created_at, approved_at, rejected_at, expired_at
+            "SELECT id, status, provider_name, gpu, duration_seconds, created_at, approved_at, rejected_at, expired_at
              FROM leases WHERE id = ?1",
         )?;
         let result = stmt
@@ -371,7 +374,7 @@ impl Store {
 
         if let Some(status) = status_filter {
             let mut stmt = conn.prepare(
-                "SELECT id, status, provider_name, duration_seconds, created_at, approved_at, rejected_at, expired_at
+                "SELECT id, status, provider_name, gpu, duration_seconds, created_at, approved_at, rejected_at, expired_at
                  FROM leases WHERE status = ?1 ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map(params![status], |row| Ok(row_to_lease(row)))?;
@@ -380,7 +383,7 @@ impl Store {
             }
         } else {
             let mut stmt = conn.prepare(
-                "SELECT id, status, provider_name, duration_seconds, created_at, approved_at, rejected_at, expired_at
+                "SELECT id, status, provider_name, gpu, duration_seconds, created_at, approved_at, rejected_at, expired_at
                  FROM leases ORDER BY created_at DESC",
             )?;
             let rows = stmt.query_map([], |row| Ok(row_to_lease(row)))?;
@@ -515,11 +518,12 @@ fn row_to_lease(row: &rusqlite::Row) -> anyhow::Result<Lease> {
         id: row.get(0)?,
         status: serde_json::from_value(serde_json::Value::String(status_str))?,
         provider_name: row.get(2)?,
-        duration_seconds: row.get(3)?,
-        created_at: row.get(4)?,
-        approved_at: row.get(5)?,
-        rejected_at: row.get(6)?,
-        expired_at: row.get(7)?,
+        gpu: row.get(3)?,
+        duration_seconds: row.get(4)?,
+        created_at: row.get(5)?,
+        approved_at: row.get(6)?,
+        rejected_at: row.get(7)?,
+        expired_at: row.get(8)?,
     })
 }
 

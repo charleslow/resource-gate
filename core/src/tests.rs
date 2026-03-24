@@ -55,11 +55,12 @@ fn test_proposal(id: &str) -> Proposal {
     }
 }
 
-fn test_lease(id: &str, provider: &str, duration_seconds: u64) -> Lease {
+fn test_lease(id: &str, provider: &str, gpu: &str, duration_seconds: u64) -> Lease {
     Lease {
         id: id.to_string(),
         status: LeaseStatus::Pending,
         provider_name: provider.to_string(),
+        gpu: gpu.to_string(),
         duration_seconds,
         created_at: 1000.0,
         approved_at: None,
@@ -332,7 +333,7 @@ async fn test_agent_can_submit_proposal() {
     let store = test_store();
 
     // Create and approve a lease first
-    let lease = test_lease("lease-1", "local", 600);
+    let lease = test_lease("lease-1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
     store.approve_lease("lease-1").unwrap();
 
@@ -556,7 +557,7 @@ async fn test_kill_all_with_no_running_still_pauses() {
 #[tokio::test]
 async fn test_lease_lifecycle_happy_path() {
     let store = test_store();
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
 
     // Pending -> Approved
@@ -575,7 +576,7 @@ async fn test_lease_lifecycle_happy_path() {
 #[tokio::test]
 async fn test_lease_rejection() {
     let store = test_store();
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
 
     store.reject_lease("l1").unwrap();
@@ -587,7 +588,7 @@ async fn test_lease_rejection() {
 #[tokio::test]
 async fn test_lease_approve_only_works_on_pending() {
     let store = test_store();
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
     store.approve_lease("l1").unwrap();
 
@@ -602,7 +603,7 @@ async fn test_cumulative_runtime_for_lease() {
     let store = test_store();
 
     // Create and approve lease
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
     store.approve_lease("l1").unwrap();
 
@@ -629,7 +630,7 @@ async fn test_cumulative_runtime_for_lease() {
 async fn test_cumulative_runtime_includes_running_jobs() {
     let store = test_store();
 
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
 
     // A running job started at 1000, "now" is 1050 → 50s in progress
@@ -698,7 +699,7 @@ async fn test_proposal_rejected_without_lease() {
 async fn test_proposal_rejected_on_expired_lease() {
     let store = test_store();
 
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
     store.approve_lease("l1").unwrap();
     store.expire_lease("l1").unwrap();
@@ -731,6 +732,45 @@ async fn test_proposal_rejected_on_expired_lease() {
 }
 
 #[tokio::test]
+async fn test_proposal_rejected_on_gpu_mismatch() {
+    let store = test_store();
+
+    // Create lease for cpu-only
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    let state = test_app_state(store);
+    let app = crate::api::router(state);
+
+    // Submit proposal requesting A100 under a cpu-only lease
+    let body = serde_json::json!({
+        "sprint_name": "test",
+        "description": "test sprint",
+        "provider": "local",
+        "resource_request": {"gpu": "A100", "gpu_count": 1},
+        "lease_id": "l1"
+    });
+
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/proposals")
+                .header("authorization", "Bearer agent-secret")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let json = body_json(resp.into_body()).await;
+    assert!(json["error"].as_str().unwrap().contains("gpu"));
+}
+
+#[tokio::test]
 async fn test_lease_api_create_and_approve() {
     let store = test_store();
     let state = test_app_state(store.clone());
@@ -739,6 +779,7 @@ async fn test_lease_api_create_and_approve() {
     // Create lease
     let body = serde_json::json!({
         "provider": "local",
+        "gpu": "cpu-only",
         "duration_seconds": 600
     });
 
@@ -786,7 +827,7 @@ async fn test_get_lease_returns_enriched_response() {
     let store = test_store();
 
     // Create and approve lease
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
     store.approve_lease("l1").unwrap();
 
@@ -842,7 +883,7 @@ async fn test_kill_proposal_lease_exceeded() {
 #[tokio::test]
 async fn test_agent_cannot_approve_lease() {
     let store = test_store();
-    let lease = test_lease("l1", "local", 600);
+    let lease = test_lease("l1", "local", "cpu-only", 600);
     store.insert_lease(&lease).unwrap();
 
     let state = test_app_state(store);

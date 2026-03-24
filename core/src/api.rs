@@ -168,13 +168,22 @@ async fn create_proposal(
         Ok(LeaseTimeCheck::Accepted { .. }) => {}
     }
 
-    // Verify lease provider matches proposal provider
+    // Verify lease provider and GPU type match proposal
     if let Ok(Some(lease)) = state.store.get_lease(&req.lease_id) {
         if lease.provider_name != req.provider {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "error": format!("lease provider '{}' does not match proposal provider '{}'", lease.provider_name, req.provider)
+                })),
+            )
+                .into_response();
+        }
+        if lease.gpu != req.resource_request.gpu {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "error": format!("lease gpu '{}' does not match proposal gpu '{}'", lease.gpu, req.resource_request.gpu)
                 })),
             )
                 .into_response();
@@ -463,6 +472,7 @@ async fn create_lease(
         id: id.clone(),
         status: LeaseStatus::Pending,
         provider_name: req.provider,
+        gpu: req.gpu,
         duration_seconds: req.duration_seconds,
         created_at: now,
         approved_at: None,
@@ -512,6 +522,7 @@ async fn get_lease(
                 id: lease.id,
                 status: lease.status,
                 provider_name: lease.provider_name,
+                gpu: lease.gpu,
                 duration_seconds: lease.duration_seconds,
                 created_at: lease.created_at,
                 approved_at: lease.approved_at,
