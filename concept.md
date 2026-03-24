@@ -552,6 +552,8 @@ api_key_file = "/etc/claw-harness/runpod.key"
 
 6. **Sprints, not individual jobs**: Proposals are sprint-level resource requests, not per-experiment configs. The agent describes what block of work it wants to do and what resources it needs. Once approved, the agent manages execution within the approved envelope.
 
+7. **Polling only, no blocking waits**: The dispatcher deliberately avoids `docker wait` or any async wait mechanism to detect container exits. Blocking waits spawn idle background processes that sit around consuming resources until a container finishes — this is wasteful and scales poorly with concurrent jobs. Instead, the dispatcher relies solely on polling via `docker inspect`. If faster cleanup is needed, increase the polling frequency rather than introducing wait-based shortcuts.
+
 ---
 
 ## Open questions

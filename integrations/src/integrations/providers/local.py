@@ -3,6 +3,11 @@
 launch() → docker run (detached) with resource limits and shared workspace
 poll()   → docker inspect to check container status
 cancel() → docker kill
+
+Note: Containers are NOT launched with --rm.  We need to inspect them after
+exit to read exit code / OOM status, so auto-removal would race with the
+polling interval.  Instead we clean up explicitly via docker rm after
+recording the terminal state.
 """
 
 import asyncio
@@ -72,8 +77,8 @@ class LocalProvider:
         if not image:
             raise ValueError("resource_request.docker_image is required for local provider")
 
-        # Build docker run command
-        cmd = ["docker", "run", "-d", "--rm"]
+        # Build docker run command (no --rm: we clean up after reading exit status)
+        cmd = ["docker", "run", "-d"]
 
         # Resource limits
         if request.cpu_cores:
@@ -125,16 +130,16 @@ class LocalProvider:
         )
 
         if rc != 0:
-            # Container gone (--rm cleaned it up after a crash, or was removed).
-            # Report FAILED — if the dispatcher initiated a kill it already knows,
-            # but a silent crash + --rm cleanup must not look like success.
+            # Container truly gone (manually removed, or cleaned up by us on a
+            # previous poll).  Report FAILED — if the dispatcher initiated a
+            # kill it already recorded the outcome.
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=handle.launched_at,
                 ended_at=time.time(),
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
-                error="container not found — may have been removed by --rm after a crash",
+                error="container not found — may have been removed externally",
                 artifacts_path="/workspace",
             )
 
@@ -146,6 +151,7 @@ class LocalProvider:
             return JobStatus.RUNNING
 
         if status == "dead":
+            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=handle.launched_at,
@@ -166,6 +172,8 @@ class LocalProvider:
         ended_at = _parse_docker_ts(finished_at_str, time.time())
 
         if exit_code == 0 and not oom_killed:
+            # Clean up the stopped container now that we've read its state
+            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.COMPLETED,
                 started_at=started_at,
@@ -176,7 +184,7 @@ class LocalProvider:
                 artifacts_path="/workspace",
             )
         else:
-            # Get logs for error context
+            # Get logs for error context before removing the container
             _, logs, _ = await _run(
                 ["docker", "logs", "--tail", "20", container_id]
             )
@@ -185,6 +193,8 @@ class LocalProvider:
             else:
                 error_msg = f"exit code {exit_code}: {logs[-500:] if logs else 'no output'}"
 
+            # Clean up the stopped container
+            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=started_at,
@@ -196,9 +206,10 @@ class LocalProvider:
             )
 
     async def cancel(self, handle: JobHandle) -> None:
-        """Kill the Docker container."""
+        """Kill and remove the Docker container."""
         container_id = handle.provider_job_id
         await _run(["docker", "kill", container_id])
+        await _run(["docker", "rm", "-f", container_id])
 
     async def get_artifacts(self, handle: JobHandle, local_dest: str) -> None:
         """No-op — workspace is already a shared volume on the host."""
