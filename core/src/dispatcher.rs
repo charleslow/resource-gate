@@ -43,6 +43,14 @@ impl Dispatcher {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Run the dispatch loop.
+    ///
+    /// Job completion is detected exclusively via polling (provider `poll()`),
+    /// not via blocking waits like `docker wait`.  This is deliberate:
+    /// polling is a clean, uniform interface that every provider can implement,
+    /// and it avoids spawning idle background processes that block until a
+    /// container exits.  If faster detection is needed, increase the polling
+    /// frequency rather than introducing wait-based shortcuts.
     pub async fn run(self: Arc<Self>) {
         let mut ticker = interval(self.poll_interval);
         tracing::info!(
