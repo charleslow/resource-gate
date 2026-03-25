@@ -7,7 +7,8 @@ use http_body_util::BodyExt;
 use tower::ServiceExt;
 
 use crate::api::AppState;
-use crate::budget::{BudgetCheck, BudgetEnforcer};
+use crate::budget::{BudgetCheck, BudgetEnforcer, LeaseTimeCheck};
+use crate::store::JobInsertError;
 use crate::config::BudgetConfig;
 use crate::models::*;
 use crate::provider_bridge::ProviderBridge;
@@ -762,4 +763,172 @@ async fn test_agent_cannot_approve_lease() {
         .unwrap();
 
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+}
+
+// ===========================================================================
+// 7. Atomic job submission (race condition prevention)
+// ===========================================================================
+
+#[tokio::test]
+async fn test_atomic_insert_rejects_over_concurrency_limit() {
+    let store = test_store();
+
+    // Create and approve lease
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Insert 2 running jobs to hit concurrency limit of 2
+    let mut j1 = test_job("j1");
+    j1.lease_id = Some("l1".into());
+    store.insert_job(&j1).unwrap();
+
+    let mut j2 = test_job("j2");
+    j2.lease_id = Some("l1".into());
+    store.insert_job(&j2).unwrap();
+
+    // Try to atomically insert a 3rd job with max_concurrent=2
+    let mut j3 = test_job("j3");
+    j3.lease_id = Some("l1".into());
+
+    let result = store.atomic_check_and_insert_job(&j3, "l1", "local", "cpu-only", 2, 1050.0);
+    assert!(matches!(result, Err(JobInsertError::ConcurrencyLimit(_))));
+}
+
+#[tokio::test]
+async fn test_atomic_insert_rejects_expired_lease() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+    store.expire_lease("l1").unwrap();
+
+    let mut j1 = test_job("j1");
+    j1.lease_id = Some("l1".into());
+
+    let result = store.atomic_check_and_insert_job(&j1, "l1", "local", "cpu-only", 4, 1050.0);
+    assert!(matches!(result, Err(JobInsertError::Rejected(_))));
+}
+
+#[tokio::test]
+async fn test_atomic_insert_rejects_gpu_mismatch() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    let mut j1 = test_job("j1");
+    j1.lease_id = Some("l1".into());
+
+    let result = store.atomic_check_and_insert_job(&j1, "l1", "local", "A100", 4, 1050.0);
+    assert!(matches!(result, Err(JobInsertError::Rejected(_))));
+}
+
+#[tokio::test]
+async fn test_atomic_insert_rejects_no_time_remaining() {
+    let store = test_store();
+
+    // Create lease with 60s duration
+    let lease = test_lease("l1", "local", "cpu-only", 60);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Insert a completed job that used all 60s
+    let mut j1 = test_job("j1");
+    j1.lease_id = Some("l1".into());
+    j1.status = JobStatus::Completed;
+    j1.started_at = Some(1000.0);
+    j1.ended_at = Some(1060.0); // 60s used
+    store.insert_job(&j1).unwrap();
+
+    let mut j2 = test_job("j2");
+    j2.lease_id = Some("l1".into());
+
+    let result = store.atomic_check_and_insert_job(&j2, "l1", "local", "cpu-only", 4, 1100.0);
+    assert!(matches!(result, Err(JobInsertError::Rejected(_))));
+}
+
+#[tokio::test]
+async fn test_atomic_insert_succeeds_and_returns_remaining() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    // Insert a completed job that used 100s
+    let mut j1 = test_job("j1");
+    j1.lease_id = Some("l1".into());
+    j1.status = JobStatus::Completed;
+    j1.started_at = Some(1000.0);
+    j1.ended_at = Some(1100.0); // 100s
+    store.insert_job(&j1).unwrap();
+
+    let mut j2 = test_job("j2");
+    j2.lease_id = Some("l1".into());
+
+    let result = store.atomic_check_and_insert_job(&j2, "l1", "local", "cpu-only", 4, 1200.0);
+    let remaining = result.unwrap();
+    assert!((remaining - 500.0).abs() < 0.01, "expected 500s remaining, got {}", remaining);
+
+    // Verify the job was actually inserted
+    let job = store.get_job("j2").unwrap();
+    assert!(job.is_some());
+}
+
+// ===========================================================================
+// 8. Wall-clock lease expiry
+// ===========================================================================
+
+#[tokio::test]
+async fn test_wall_clock_expired_leases() {
+    let store = test_store();
+
+    // Create and approve a lease with 600s duration
+    let mut lease = test_lease("l1", "local", "cpu-only", 600);
+    lease.status = LeaseStatus::Approved;
+    lease.approved_at = Some(1000.0);
+    store.insert_lease(&lease).unwrap();
+
+    // At now=2000, elapsed=1000s, threshold=1200s (2x600) → not expired
+    let stale = store.list_wall_clock_expired_leases(2000.0, 2.0).unwrap();
+    assert_eq!(stale.len(), 0);
+
+    // At now=2300, elapsed=1300s, threshold=1200s → expired
+    let stale = store.list_wall_clock_expired_leases(2300.0, 2.0).unwrap();
+    assert_eq!(stale.len(), 1);
+    assert_eq!(stale[0].id, "l1");
+}
+
+#[tokio::test]
+async fn test_expire_lease_only_affects_approved() {
+    let store = test_store();
+
+    // Create a pending lease
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+
+    // Try to expire it (should be no-op since it's pending, not approved)
+    store.expire_lease("l1").unwrap();
+    let l = store.get_lease("l1").unwrap().unwrap();
+    assert_eq!(l.status, LeaseStatus::Pending); // unchanged
+}
+
+#[tokio::test]
+async fn test_lease_has_time_still_works() {
+    let store = test_store();
+
+    let lease = test_lease("l1", "local", "cpu-only", 600);
+    store.insert_lease(&lease).unwrap();
+    store.approve_lease("l1").unwrap();
+
+    let enforcer = BudgetEnforcer::new(budget_config(0.0), store);
+    match enforcer.lease_has_time("l1", 1050.0).unwrap() {
+        LeaseTimeCheck::Accepted { remaining_seconds } => {
+            assert!((remaining_seconds - 600.0).abs() < 0.01);
+        }
+        LeaseTimeCheck::Rejected { reason } => panic!("unexpected rejection: {}", reason),
+    }
 }

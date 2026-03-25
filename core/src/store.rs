@@ -112,34 +112,6 @@ impl Store {
             ",
         )?;
 
-        // Migration from old schema: rename proposals table to jobs
-        // (safe to fail if already migrated or fresh DB)
-        let _ = conn.execute_batch(
-            "ALTER TABLE proposals RENAME TO _proposals_old;
-             INSERT OR IGNORE INTO jobs SELECT
-                 id, status, sprint_name, description, provider_name,
-                 resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                 provider_job_id, created_at, dispatched_at, started_at, ended_at,
-                 result_payload, error, kill_reason, lease_id, runtime_seconds,
-                 lease_remaining_at_start
-             FROM _proposals_old;
-             DROP TABLE _proposals_old;",
-        );
-
-        // Migration from old cost_ledger schema: rename proposal_id to job_id
-        let _ = conn.execute("ALTER TABLE cost_ledger RENAME COLUMN proposal_id TO job_id", []);
-
-        // Add lease-related columns to jobs (safe to re-run for upgraded old DBs)
-        let alter_statements = [
-            "ALTER TABLE jobs ADD COLUMN lease_id TEXT",
-            "ALTER TABLE jobs ADD COLUMN runtime_seconds REAL",
-            "ALTER TABLE jobs ADD COLUMN lease_remaining_at_start REAL",
-            "ALTER TABLE leases ADD COLUMN gpu TEXT NOT NULL DEFAULT 'cpu-only'",
-        ];
-        for stmt in &alter_statements {
-            let _ = conn.execute(stmt, []);
-        }
-
         Ok(())
     }
 
@@ -399,7 +371,7 @@ impl Store {
     pub fn expire_lease(&self, id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE leases SET status = 'expired', expired_at = ?1 WHERE id = ?2",
+            "UPDATE leases SET status = 'expired', expired_at = ?1 WHERE id = ?2 AND status = 'approved'",
             params![now(), id],
         )?;
         Ok(())
@@ -467,6 +439,157 @@ impl Store {
         Ok(())
     }
 
+    /// Atomically check lease validity + concurrency limit + insert job.
+    /// Returns remaining_seconds on success, or an error describing why the job was rejected.
+    /// This prevents race conditions where concurrent submissions both pass checks
+    /// before either inserts.
+    pub fn atomic_check_and_insert_job(
+        &self,
+        job: &Job,
+        lease_id: &str,
+        provider_name: &str,
+        expected_gpu: &str,
+        max_concurrent: u32,
+        now_ts: f64,
+    ) -> Result<f64, JobInsertError> {
+        let conn = self.conn.lock().unwrap();
+
+        // 1. Check lease exists, is approved, and matches provider/GPU
+        let lease_row: Option<(String, String, String, u64)> = conn
+            .query_row(
+                "SELECT status, provider_name, gpu, duration_seconds FROM leases WHERE id = ?1",
+                params![lease_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .optional()
+            .map_err(|e| JobInsertError::Internal(e.to_string()))?;
+
+        let (status, lease_provider, lease_gpu, duration_seconds) = match lease_row {
+            Some(r) => r,
+            None => {
+                return Err(JobInsertError::Rejected(format!(
+                    "lease {} not found",
+                    lease_id
+                )));
+            }
+        };
+
+        if status != "approved" {
+            return Err(JobInsertError::Rejected(format!(
+                "lease {} is {}, not approved",
+                lease_id, status
+            )));
+        }
+
+        if lease_provider != provider_name {
+            return Err(JobInsertError::Rejected(format!(
+                "lease provider '{}' does not match job provider '{}'",
+                lease_provider, provider_name
+            )));
+        }
+
+        if lease_gpu != expected_gpu {
+            return Err(JobInsertError::Rejected(format!(
+                "lease gpu '{}' does not match job gpu '{}'",
+                lease_gpu, expected_gpu
+            )));
+        }
+
+        // 2. Check lease time remaining
+        let used: f64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(COALESCE(ended_at, ?1) - started_at), 0.0)
+                 FROM jobs
+                 WHERE lease_id = ?2
+                   AND started_at IS NOT NULL
+                   AND status IN ('running', 'completed', 'failed', 'killed')",
+                params![now_ts, lease_id],
+                |row| row.get(0),
+            )
+            .map_err(|e| JobInsertError::Internal(e.to_string()))?;
+
+        let remaining = duration_seconds as f64 - used;
+        if remaining <= 0.0 {
+            return Err(JobInsertError::Rejected(format!(
+                "lease {} has no time remaining ({:.0}s used of {}s)",
+                lease_id, used, duration_seconds
+            )));
+        }
+
+        // 3. Check concurrency limit
+        let running: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM jobs WHERE provider_name = ?1 AND status = 'running'",
+                params![provider_name],
+                |row| row.get(0),
+            )
+            .map_err(|e| JobInsertError::Internal(e.to_string()))?;
+
+        if running >= max_concurrent {
+            return Err(JobInsertError::ConcurrencyLimit(format!(
+                "provider '{}' at concurrency limit ({}/{})",
+                provider_name, running, max_concurrent
+            )));
+        }
+
+        // 4. Insert the job (all checks passed while holding the lock)
+        conn.execute(
+            "INSERT INTO jobs (
+                id, status, sprint_name, description, provider_name,
+                resource_request, config, budget_cap_usd, estimated_minutes, tags,
+                provider_job_id, created_at, dispatched_at,
+                started_at, ended_at, result_payload, error, kill_reason,
+                lease_id, runtime_seconds, lease_remaining_at_start
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                job.id,
+                job.status.to_string(),
+                job.sprint_name,
+                job.description,
+                job.provider_name,
+                serde_json::to_string(&job.resource_request).map_err(|e| JobInsertError::Internal(e.to_string()))?,
+                job.config.to_string(),
+                job.budget_cap_usd,
+                job.estimated_minutes,
+                job.tags.to_string(),
+                job.provider_job_id,
+                job.created_at,
+                job.dispatched_at,
+                job.started_at,
+                job.ended_at,
+                job.result_payload.as_ref().map(|v| v.to_string()),
+                job.error,
+                job.kill_reason,
+                job.lease_id,
+                job.runtime_seconds,
+                job.lease_remaining_at_start,
+            ],
+        )
+        .map_err(|e| JobInsertError::Internal(e.to_string()))?;
+
+        Ok(remaining)
+    }
+
+    /// Find approved leases that have exceeded their wall-clock deadline
+    /// (2x duration_seconds since approval). These should be expired even if
+    /// no jobs have consumed the lease time, to prevent stale leases.
+    pub fn list_wall_clock_expired_leases(&self, now_ts: f64, multiplier: f64) -> anyhow::Result<Vec<Lease>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, status, provider_name, gpu, duration_seconds, created_at, approved_at, rejected_at, expired_at
+             FROM leases
+             WHERE status = 'approved'
+               AND approved_at IS NOT NULL
+               AND (?1 - approved_at) > (duration_seconds * ?2)",
+        )?;
+        let rows = stmt.query_map(params![now_ts, multiplier], |row| Ok(row_to_lease(row)))?;
+        let mut leases = Vec::new();
+        for row in rows {
+            leases.push(row??);
+        }
+        Ok(leases)
+    }
+
     // -- Budget config --
 
     pub fn set_budget_config(
@@ -482,6 +605,27 @@ impl Store {
             params![daily_limit, alert_pct, auto_pause as i32],
         )?;
         Ok(())
+    }
+}
+
+/// Error returned by `atomic_check_and_insert_job` when the job cannot be inserted.
+#[derive(Debug)]
+pub enum JobInsertError {
+    /// Lease validation failed (not found, not approved, GPU mismatch, no time remaining).
+    Rejected(String),
+    /// Provider concurrency limit reached.
+    ConcurrencyLimit(String),
+    /// Internal database or serialization error.
+    Internal(String),
+}
+
+impl std::fmt::Display for JobInsertError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rejected(msg) => write!(f, "{}", msg),
+            Self::ConcurrencyLimit(msg) => write!(f, "{}", msg),
+            Self::Internal(msg) => write!(f, "internal error: {}", msg),
+        }
     }
 }
 

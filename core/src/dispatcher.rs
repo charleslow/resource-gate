@@ -93,6 +93,10 @@ impl Dispatcher {
             .unwrap()
             .as_secs_f64();
 
+        // Track job IDs killed during lease expiry to avoid redundant DB reads
+        let mut killed_job_ids: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+
         // Group by lease_id to check lease budgets once per lease
         let mut lease_checked: std::collections::HashSet<String> = std::collections::HashSet::new();
 
@@ -151,6 +155,8 @@ impl Dispatcher {
                                             e
                                         );
                                     }
+
+                                    killed_job_ids.insert(j.id.clone());
                                 }
                             }
 
@@ -164,17 +170,42 @@ impl Dispatcher {
             }
         }
 
-        // Now handle per-job checks (timeout, polling) for jobs not already killed
-        for job in &running {
-            // Skip if already killed by lease expiry above
-            if let Some(ref lease_id) = job.lease_id {
-                if lease_checked.contains(lease_id) {
-                    if let Ok(Some(j)) = self.store.get_job(&job.id) {
-                        if j.status == JobStatus::Killed {
-                            continue;
+        // Expire approved leases that have exceeded their wall-clock deadline
+        // (2x duration_seconds since approval) even if no jobs consumed the time.
+        const WALL_CLOCK_MULTIPLIER: f64 = 2.0;
+        if let Ok(stale_leases) = self
+            .store
+            .list_wall_clock_expired_leases(now, WALL_CLOCK_MULTIPLIER)
+        {
+            for lease in &stale_leases {
+                tracing::warn!(
+                    "lease {} exceeded wall-clock deadline ({:.0}s since approval, limit {}s) — expiring",
+                    lease.id,
+                    now - lease.approved_at.unwrap_or(now),
+                    lease.duration_seconds as f64 * WALL_CLOCK_MULTIPLIER,
+                );
+
+                // Kill any running jobs under this lease
+                if let Ok(lease_jobs) = self.store.list_jobs_for_lease(&lease.id) {
+                    for j in &lease_jobs {
+                        if j.status == JobStatus::Running && !killed_job_ids.contains(&j.id) {
+                            self.cancel_and_kill(j, "wall_clock_expired").await;
+                            killed_job_ids.insert(j.id.clone());
                         }
                     }
                 }
+
+                if let Err(e) = self.store.expire_lease(&lease.id) {
+                    tracing::error!("failed to expire stale lease {}: {}", lease.id, e);
+                }
+            }
+        }
+
+        // Now handle per-job checks (timeout, polling) for jobs not already killed
+        for job in &running {
+            // Skip if already killed by lease expiry above (in-memory check, no DB read)
+            if killed_job_ids.contains(&job.id) {
+                continue;
             }
 
             let started_at = match job.started_at {

@@ -23,10 +23,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::budget::{BudgetEnforcer, LeaseTimeCheck};
+use crate::budget::BudgetEnforcer;
 use crate::models::*;
 use crate::provider_bridge::ProviderBridge;
-use crate::store::Store;
+use crate::store::{JobInsertError, Store};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -151,129 +151,24 @@ async fn create_job(
         .unwrap()
         .as_secs_f64();
 
-    // Lease validation: must be approved and have time remaining
-    match state.budget.lease_has_time(&req.lease_id, now) {
-        Ok(LeaseTimeCheck::Rejected { reason }) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({"error": reason})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-        Ok(LeaseTimeCheck::Accepted { .. }) => {}
-    }
-
-    // Verify lease provider and GPU type match job request
-    if let Ok(Some(lease)) = state.store.get_lease(&req.lease_id) {
-        if lease.provider_name != req.provider {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("lease provider '{}' does not match job provider '{}'", lease.provider_name, req.provider)
-                })),
-            )
-                .into_response();
-        }
-        if lease.gpu != req.resource_request.gpu {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(serde_json::json!({
-                    "error": format!("lease gpu '{}' does not match job gpu '{}'", lease.gpu, req.resource_request.gpu)
-                })),
-            )
-                .into_response();
-        }
-    }
-
-    // Concurrency check
-    let max_concurrent = state.concurrency_limits.get(&req.provider).copied().unwrap_or(4);
-    match state.store.count_running_jobs_for_provider(&req.provider) {
-        Ok(running) if running >= max_concurrent => {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "error": format!("provider '{}' at concurrency limit ({}/{})", req.provider, running, max_concurrent)
-                })),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-        _ => {}
-    }
-
     let id = format!("job_{}", ulid::Ulid::new());
+    let max_concurrent = state.concurrency_limits.get(&req.provider).copied().unwrap_or(4);
 
-    // Launch immediately via provider bridge
-    let handle = match state
-        .bridge
-        .launch(&req.provider, &req.resource_request, &req.config)
-        .await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            // Record the failed launch attempt for audit trail
-            let job = Job {
-                id: id.clone(),
-                status: JobStatus::Failed,
-                sprint_name: req.sprint_name,
-                description: req.description,
-                provider_name: req.provider,
-                resource_request: req.resource_request,
-                config: req.config,
-                budget_cap_usd: req.budget_cap_usd,
-                estimated_minutes: req.estimated_minutes,
-                tags: req.tags,
-                provider_job_id: None,
-                created_at: now,
-                dispatched_at: None,
-                started_at: None,
-                ended_at: Some(now),
-                result_payload: None,
-                error: Some(e.to_string()),
-                kill_reason: None,
-                lease_id: Some(req.lease_id),
-                runtime_seconds: None,
-                lease_remaining_at_start: None,
-            };
-            let _ = state.store.insert_job(&job);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "error": format!("launch failed: {}", e),
-                    "job_id": id,
-                    "status": "failed"
-                })),
-            )
-                .into_response();
-        }
-    };
-
-    // Job launched successfully — store as Running
+    // Atomically validate lease + concurrency + insert job as Running.
+    // This prevents race conditions where concurrent submissions both pass
+    // checks before either inserts.
     let job = Job {
         id: id.clone(),
         status: JobStatus::Running,
-        sprint_name: req.sprint_name,
-        description: req.description,
-        provider_name: req.provider,
-        resource_request: req.resource_request,
-        config: req.config,
+        sprint_name: req.sprint_name.clone(),
+        description: req.description.clone(),
+        provider_name: req.provider.clone(),
+        resource_request: req.resource_request.clone(),
+        config: req.config.clone(),
         budget_cap_usd: req.budget_cap_usd,
         estimated_minutes: req.estimated_minutes,
-        tags: req.tags,
-        provider_job_id: Some(handle.provider_job_id),
+        tags: req.tags.clone(),
+        provider_job_id: None,
         created_at: now,
         dispatched_at: Some(now),
         started_at: Some(now),
@@ -281,25 +176,77 @@ async fn create_job(
         result_payload: None,
         error: None,
         kill_reason: None,
-        lease_id: Some(req.lease_id),
+        lease_id: Some(req.lease_id.clone()),
         runtime_seconds: None,
         lease_remaining_at_start: None,
     };
 
-    match state.store.insert_job(&job) {
-        Ok(()) => (
-            StatusCode::CREATED,
-            Json(serde_json::json!({
-                "job_id": id,
-                "status": "running"
-            })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
+    let remaining_seconds = match state.store.atomic_check_and_insert_job(
+        &job,
+        &req.lease_id,
+        &req.provider,
+        &req.resource_request.gpu,
+        max_concurrent,
+        now,
+    ) {
+        Ok(remaining) => remaining,
+        Err(JobInsertError::Rejected(reason)) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": reason})),
+            )
+                .into_response();
+        }
+        Err(JobInsertError::ConcurrencyLimit(reason)) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({"error": reason})),
+            )
+                .into_response();
+        }
+        Err(JobInsertError::Internal(reason)) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({"error": reason})),
+            )
+                .into_response();
+        }
+    };
+
+    // Job is now inserted as Running. Launch via provider bridge.
+    match state
+        .bridge
+        .launch(&req.provider, &req.resource_request, &req.config)
+        .await
+    {
+        Ok(handle) => {
+            // Update with provider job ID
+            if let Err(e) = state.store.set_job_running(&id, &handle.provider_job_id) {
+                tracing::error!("failed to set provider_job_id for {}: {}", id, e);
+            }
+            (
+                StatusCode::CREATED,
+                Json(serde_json::json!({
+                    "job_id": id,
+                    "status": "running",
+                    "remaining_seconds": remaining_seconds,
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => {
+            // Launch failed — mark the already-inserted job as failed
+            let _ = state.store.fail_job(&id, &e.to_string());
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("launch failed: {}", e),
+                    "job_id": id,
+                    "status": "failed"
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
