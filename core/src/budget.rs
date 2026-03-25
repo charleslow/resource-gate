@@ -1,4 +1,4 @@
-// Budget enforcement: per-job caps, daily limits, agent ceiling
+// Budget enforcement: per-job caps, daily limits, lease time gates
 
 use crate::config::BudgetConfig;
 use crate::store::Store;
@@ -13,7 +13,7 @@ impl BudgetEnforcer {
         Self { config, store }
     }
 
-    /// Check if a new proposal with the given budget cap can be accepted
+    /// Check if a new job with the given budget cap can be accepted
     /// without exceeding the daily limit. A daily_limit_usd of 0 means unlimited.
     pub fn can_accept(&self, budget_cap_usd: f64) -> anyhow::Result<BudgetCheck> {
         // 0 means unlimited — always accept
@@ -68,7 +68,8 @@ impl BudgetEnforcer {
         self.store.daily_spend()
     }
 
-    /// Check if a lease has time remaining for new jobs.
+    /// Check if a lease is approved and has time remaining for new jobs.
+    /// This is the single gate for job submission.
     pub fn lease_has_time(&self, lease_id: &str, now_ts: f64) -> anyhow::Result<LeaseTimeCheck> {
         let lease = self.store.get_lease(lease_id)?;
         let lease = match lease {
