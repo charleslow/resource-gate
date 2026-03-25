@@ -1,10 +1,14 @@
 // HTTP API handlers (axum)
-// Endpoints: /proposals, /budget, /providers, /system
+// Endpoints: /jobs, /leases, /budget, /providers, /system
 //
 // Auth: two token roles.
-// - agent_token: can submit proposals, query status, complete sprints
-// - admin_token: can approve/reject proposals, pause/resume, kill
+// - agent_token: can submit jobs, query status, complete sprints
+// - admin_token: can approve/reject leases, pause/resume, kill
 // If no tokens configured, all endpoints are open (dev mode).
+//
+// Jobs run immediately on submission (no per-job approval).
+// The lease is the approval gate — once a lease is approved,
+// any job submitted under it starts running right away.
 
 use axum::{
     extract::{Path, Query, Request, State},
@@ -103,12 +107,12 @@ async fn require_admin(
 }
 
 pub fn router(state: AppState) -> Router {
-    // Agent routes: submit, query, complete
+    // Agent routes: submit jobs, query, complete
     let agent_routes = Router::new()
-        .route("/proposals", post(create_proposal))
-        .route("/proposals", get(list_proposals))
-        .route("/proposals/{id}", get(get_proposal))
-        .route("/proposals/{id}/complete", post(complete_proposal))
+        .route("/jobs", post(create_job))
+        .route("/jobs", get(list_jobs))
+        .route("/jobs/{id}", get(get_job))
+        .route("/jobs/{id}/complete", post(complete_job))
         .route("/leases", post(create_lease))
         .route("/leases", get(list_leases))
         .route("/leases/{id}", get(get_lease))
@@ -120,11 +124,9 @@ pub fn router(state: AppState) -> Router {
             require_agent_or_admin,
         ));
 
-    // Admin routes: approve, reject, cancel, pause, resume, kill
+    // Admin routes: approve/reject leases, cancel jobs, pause, resume, kill
     let admin_routes = Router::new()
-        .route("/proposals/{id}/approve", post(approve_proposal))
-        .route("/proposals/{id}/reject", post(reject_proposal))
-        .route("/proposals/{id}", delete(cancel_proposal))
+        .route("/jobs/{id}", delete(cancel_job))
         .route("/leases/{id}/approve", post(approve_lease))
         .route("/leases/{id}/reject", post(reject_lease))
         .route("/system/pause", post(system_pause))
@@ -138,18 +140,18 @@ pub fn router(state: AppState) -> Router {
     agent_routes.merge(admin_routes).with_state(state)
 }
 
-// -- Proposals --
+// -- Jobs --
 
-async fn create_proposal(
+async fn create_job(
     State(state): State<AppState>,
-    Json(req): Json<CreateProposalRequest>,
+    Json(req): Json<CreateJobRequest>,
 ) -> impl IntoResponse {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs_f64();
 
-    // Lease validation
+    // Lease validation: must be approved and have time remaining
     match state.budget.lease_has_time(&req.lease_id, now) {
         Ok(LeaseTimeCheck::Rejected { reason }) => {
             return (
@@ -168,13 +170,13 @@ async fn create_proposal(
         Ok(LeaseTimeCheck::Accepted { .. }) => {}
     }
 
-    // Verify lease provider and GPU type match proposal
+    // Verify lease provider and GPU type match job request
     if let Ok(Some(lease)) = state.store.get_lease(&req.lease_id) {
         if lease.provider_name != req.provider {
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("lease provider '{}' does not match proposal provider '{}'", lease.provider_name, req.provider)
+                    "error": format!("lease provider '{}' does not match job provider '{}'", lease.provider_name, req.provider)
                 })),
             )
                 .into_response();
@@ -183,7 +185,7 @@ async fn create_proposal(
             return (
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
-                    "error": format!("lease gpu '{}' does not match proposal gpu '{}'", lease.gpu, req.resource_request.gpu)
+                    "error": format!("lease gpu '{}' does not match job gpu '{}'", lease.gpu, req.resource_request.gpu)
                 })),
             )
                 .into_response();
@@ -212,11 +214,57 @@ async fn create_proposal(
         _ => {}
     }
 
-    let id = format!("prop_{}", ulid::Ulid::new());
+    let id = format!("job_{}", ulid::Ulid::new());
 
-    let proposal = Proposal {
+    // Launch immediately via provider bridge
+    let handle = match state
+        .bridge
+        .launch(&req.provider, &req.resource_request, &req.config)
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            // Record the failed launch attempt for audit trail
+            let job = Job {
+                id: id.clone(),
+                status: JobStatus::Failed,
+                sprint_name: req.sprint_name,
+                description: req.description,
+                provider_name: req.provider,
+                resource_request: req.resource_request,
+                config: req.config,
+                budget_cap_usd: req.budget_cap_usd,
+                estimated_minutes: req.estimated_minutes,
+                tags: req.tags,
+                provider_job_id: None,
+                created_at: now,
+                dispatched_at: None,
+                started_at: None,
+                ended_at: Some(now),
+                result_payload: None,
+                error: Some(e.to_string()),
+                kill_reason: None,
+                lease_id: Some(req.lease_id),
+                runtime_seconds: None,
+                lease_remaining_at_start: None,
+            };
+            let _ = state.store.insert_job(&job);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "error": format!("launch failed: {}", e),
+                    "job_id": id,
+                    "status": "failed"
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    // Job launched successfully — store as Running
+    let job = Job {
         id: id.clone(),
-        status: ProposalStatus::Pending,
+        status: JobStatus::Running,
         sprint_name: req.sprint_name,
         description: req.description,
         provider_name: req.provider,
@@ -225,11 +273,10 @@ async fn create_proposal(
         budget_cap_usd: req.budget_cap_usd,
         estimated_minutes: req.estimated_minutes,
         tags: req.tags,
-        provider_job_id: None,
+        provider_job_id: Some(handle.provider_job_id),
         created_at: now,
-        approved_at: None,
-        dispatched_at: None,
-        started_at: None,
+        dispatched_at: Some(now),
+        started_at: Some(now),
         ended_at: None,
         result_payload: None,
         error: None,
@@ -239,12 +286,12 @@ async fn create_proposal(
         lease_remaining_at_start: None,
     };
 
-    match state.store.insert_proposal(&proposal) {
+    match state.store.insert_job(&job) {
         Ok(()) => (
             StatusCode::CREATED,
             Json(serde_json::json!({
-                "proposal_id": id,
-                "status": "pending"
+                "job_id": id,
+                "status": "running"
             })),
         )
             .into_response(),
@@ -261,15 +308,15 @@ struct ListQuery {
     status: Option<String>,
 }
 
-async fn list_proposals(
+async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
 ) -> impl IntoResponse {
     match state
         .store
-        .list_proposals(query.status.as_deref())
+        .list_jobs(query.status.as_deref())
     {
-        Ok(proposals) => Json(serde_json::json!({"proposals": proposals})).into_response(),
+        Ok(jobs) => Json(serde_json::json!({"jobs": jobs})).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({"error": e.to_string()})),
@@ -278,12 +325,12 @@ async fn list_proposals(
     }
 }
 
-async fn get_proposal(
+async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.store.get_proposal(&id) {
-        Ok(Some(p)) => Json(serde_json::to_value(p).unwrap()).into_response(),
+    match state.store.get_job(&id) {
+        Ok(Some(j)) => Json(serde_json::to_value(j).unwrap()).into_response(),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({"error": "not found"})),
@@ -297,82 +344,28 @@ async fn get_proposal(
     }
 }
 
-async fn approve_proposal(
+async fn complete_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> impl IntoResponse {
-    // Verify it exists and is pending
-    match state.store.get_proposal(&id) {
-        Ok(Some(p)) if p.status == ProposalStatus::Pending => {}
-        Ok(Some(p)) => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({"error": format!("proposal is {}, not pending", p.status)})),
-            )
-                .into_response();
-        }
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    }
-
-    match state.store.approve_proposal(&id) {
-        Ok(()) => Json(serde_json::json!({"status": "approved"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn reject_proposal(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> impl IntoResponse {
-    match state.store.reject_proposal(&id) {
-        Ok(()) => Json(serde_json::json!({"status": "rejected"})).into_response(),
-        Err(e) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({"error": e.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-async fn complete_proposal(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<CompleteProposalRequest>,
+    Json(req): Json<CompleteJobRequest>,
 ) -> impl IntoResponse {
     // Verify it's running
-    match state.store.get_proposal(&id) {
-        Ok(Some(p)) if p.status == ProposalStatus::Running => {
+    match state.store.get_job(&id) {
+        Ok(Some(j)) if j.status == JobStatus::Running => {
             // Record cost based on elapsed time
-            let started = p.started_at.unwrap_or(p.created_at);
+            let started = j.started_at.unwrap_or(j.created_at);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_secs_f64();
-            let gpu_seconds = (now - started) * p.resource_request.gpu_count as f64;
+            let gpu_seconds = (now - started) * j.resource_request.gpu_count as f64;
 
             let cost_entry = CostEntry {
                 id: format!("cost_{}", ulid::Ulid::new()),
-                proposal_id: p.id.clone(),
-                provider_name: p.provider_name.clone(),
-                gpu_type: p.resource_request.gpu.clone(),
-                gpu_count: p.resource_request.gpu_count,
+                job_id: j.id.clone(),
+                provider_name: j.provider_name.clone(),
+                gpu_type: j.resource_request.gpu.clone(),
+                gpu_count: j.resource_request.gpu_count,
                 gpu_seconds,
                 rate_per_gpu_second: 0.0, // local is free
                 computed_cost_usd: 0.0,
@@ -382,7 +375,7 @@ async fn complete_proposal(
 
             match state
                 .store
-                .complete_proposal(&id, req.result_payload.as_ref())
+                .complete_job(&id, req.result_payload.as_ref())
             {
                 Ok(()) => Json(serde_json::json!({"status": "completed"})).into_response(),
                 Err(e) => (
@@ -392,9 +385,9 @@ async fn complete_proposal(
                     .into_response(),
             }
         }
-        Ok(Some(p)) => (
+        Ok(Some(j)) => (
             StatusCode::CONFLICT,
-            Json(serde_json::json!({"error": format!("proposal is {}, not running", p.status)})),
+            Json(serde_json::json!({"error": format!("job is {}, not running", j.status)})),
         )
             .into_response(),
         Ok(None) => (
@@ -410,32 +403,29 @@ async fn complete_proposal(
     }
 }
 
-async fn cancel_proposal(
+async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    match state.store.get_proposal(&id) {
-        Ok(Some(p)) => {
-            match p.status {
-                ProposalStatus::Pending => {
-                    let _ = state.store.reject_proposal(&id);
-                }
-                ProposalStatus::Running | ProposalStatus::Approved | ProposalStatus::Dispatching => {
-                    // Cancel via provider if running
-                    if let Some(ref job_id) = p.provider_job_id {
+    match state.store.get_job(&id) {
+        Ok(Some(j)) => {
+            match j.status {
+                JobStatus::Running => {
+                    // Cancel via provider
+                    if let Some(ref job_id) = j.provider_job_id {
                         let handle = crate::models::JobHandle {
-                            provider_name: p.provider_name.clone(),
+                            provider_name: j.provider_name.clone(),
                             provider_job_id: job_id.clone(),
-                            launched_at: p.dispatched_at.unwrap_or(0.0),
+                            launched_at: j.dispatched_at.unwrap_or(0.0),
                         };
-                        let _ = state.bridge.cancel(&p.provider_name, &handle).await;
+                        let _ = state.bridge.cancel(&j.provider_name, &handle).await;
                     }
-                    let _ = state.store.kill_proposal(&id, "cancelled_by_user");
+                    let _ = state.store.kill_job(&id, "cancelled_by_user");
                 }
                 _ => {
                     return (
                         StatusCode::CONFLICT,
-                        Json(serde_json::json!({"error": format!("proposal is {} and cannot be cancelled", p.status)})),
+                        Json(serde_json::json!({"error": format!("job is {} and cannot be cancelled", j.status)})),
                     )
                         .into_response();
                 }
@@ -515,7 +505,7 @@ async fn get_lease(
             let time_remaining = (lease.duration_seconds as f64 - time_used).max(0.0);
             let jobs = state
                 .store
-                .list_proposals_for_lease(&id)
+                .list_jobs_for_lease(&id)
                 .unwrap_or_default();
 
             let response = LeaseResponse {
@@ -686,20 +676,14 @@ async fn list_providers(State(state): State<AppState>) -> impl IntoResponse {
 async fn system_status(State(state): State<AppState>) -> impl IntoResponse {
     let running = state
         .store
-        .list_proposals(Some("running"))
-        .map(|v| v.len())
-        .unwrap_or(0);
-    let pending = state
-        .store
-        .list_proposals(Some("pending"))
+        .list_jobs(Some("running"))
         .map(|v| v.len())
         .unwrap_or(0);
     let paused = state.paused.load(Ordering::Relaxed);
 
     Json(serde_json::json!({
         "dispatcher_paused": paused,
-        "running_sprints": running,
-        "pending_proposals": pending,
+        "running_jobs": running,
     }))
 }
 
@@ -714,19 +698,19 @@ async fn system_resume(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn kill_all(State(state): State<AppState>) -> impl IntoResponse {
-    let running = state.store.list_proposals(Some("running")).unwrap_or_default();
+    let running = state.store.list_jobs(Some("running")).unwrap_or_default();
     let mut killed = 0;
 
-    for p in running {
-        if let Some(ref job_id) = p.provider_job_id {
+    for j in running {
+        if let Some(ref job_id) = j.provider_job_id {
             let handle = crate::models::JobHandle {
-                provider_name: p.provider_name.clone(),
+                provider_name: j.provider_name.clone(),
                 provider_job_id: job_id.clone(),
-                launched_at: p.dispatched_at.unwrap_or(0.0),
+                launched_at: j.dispatched_at.unwrap_or(0.0),
             };
-            let _ = state.bridge.cancel(&p.provider_name, &handle).await;
+            let _ = state.bridge.cancel(&j.provider_name, &handle).await;
         }
-        let _ = state.store.kill_proposal(&p.id, "kill_all");
+        let _ = state.store.kill_job(&j.id, "kill_all");
         killed += 1;
     }
 

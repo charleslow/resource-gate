@@ -1,4 +1,4 @@
-// SQLite operations for proposals and cost ledger (rusqlite)
+// SQLite operations for jobs, leases, and cost ledger (rusqlite)
 
 use rusqlite::{params, Connection, OptionalExtension};
 use std::path::Path;
@@ -54,7 +54,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute_batch(
             "
-            CREATE TABLE IF NOT EXISTS proposals (
+            CREATE TABLE IF NOT EXISTS jobs (
                 id TEXT PRIMARY KEY,
                 status TEXT NOT NULL,
                 sprint_name TEXT NOT NULL,
@@ -67,7 +67,6 @@ impl Store {
                 tags TEXT NOT NULL DEFAULT '{}',
                 provider_job_id TEXT,
                 created_at REAL NOT NULL,
-                approved_at REAL,
                 dispatched_at REAL,
                 started_at REAL,
                 ended_at REAL,
@@ -81,7 +80,7 @@ impl Store {
 
             CREATE TABLE IF NOT EXISTS cost_ledger (
                 id TEXT PRIMARY KEY,
-                proposal_id TEXT NOT NULL,
+                job_id TEXT NOT NULL,
                 provider_name TEXT NOT NULL,
                 gpu_type TEXT NOT NULL,
                 gpu_count INTEGER NOT NULL,
@@ -89,7 +88,7 @@ impl Store {
                 rate_per_gpu_second REAL NOT NULL,
                 computed_cost_usd REAL NOT NULL,
                 recorded_at REAL NOT NULL,
-                FOREIGN KEY (proposal_id) REFERENCES proposals(id)
+                FOREIGN KEY (job_id) REFERENCES jobs(id)
             );
 
             CREATE TABLE IF NOT EXISTS daily_budget_config (
@@ -113,182 +112,166 @@ impl Store {
             ",
         )?;
 
-        // Add lease-related columns to proposals (safe to re-run)
+        // Migration from old schema: rename proposals table to jobs
+        // (safe to fail if already migrated or fresh DB)
+        let _ = conn.execute_batch(
+            "ALTER TABLE proposals RENAME TO _proposals_old;
+             INSERT OR IGNORE INTO jobs SELECT
+                 id, status, sprint_name, description, provider_name,
+                 resource_request, config, budget_cap_usd, estimated_minutes, tags,
+                 provider_job_id, created_at, dispatched_at, started_at, ended_at,
+                 result_payload, error, kill_reason, lease_id, runtime_seconds,
+                 lease_remaining_at_start
+             FROM _proposals_old;
+             DROP TABLE _proposals_old;",
+        );
+
+        // Migration from old cost_ledger schema: rename proposal_id to job_id
+        let _ = conn.execute("ALTER TABLE cost_ledger RENAME COLUMN proposal_id TO job_id", []);
+
+        // Add lease-related columns to jobs (safe to re-run for upgraded old DBs)
         let alter_statements = [
-            "ALTER TABLE proposals ADD COLUMN lease_id TEXT",
-            "ALTER TABLE proposals ADD COLUMN runtime_seconds REAL",
-            "ALTER TABLE proposals ADD COLUMN lease_remaining_at_start REAL",
+            "ALTER TABLE jobs ADD COLUMN lease_id TEXT",
+            "ALTER TABLE jobs ADD COLUMN runtime_seconds REAL",
+            "ALTER TABLE jobs ADD COLUMN lease_remaining_at_start REAL",
             "ALTER TABLE leases ADD COLUMN gpu TEXT NOT NULL DEFAULT 'cpu-only'",
         ];
         for stmt in &alter_statements {
-            // Ignore "duplicate column" errors
             let _ = conn.execute(stmt, []);
         }
 
         Ok(())
     }
 
-    // -- Proposals --
+    // -- Jobs --
 
-    pub fn insert_proposal(&self, p: &Proposal) -> anyhow::Result<()> {
+    pub fn insert_job(&self, job: &Job) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO proposals (
+            "INSERT INTO jobs (
                 id, status, sprint_name, description, provider_name,
                 resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                provider_job_id, created_at, approved_at, dispatched_at,
+                provider_job_id, created_at, dispatched_at,
                 started_at, ended_at, result_payload, error, kill_reason,
                 lease_id, runtime_seconds, lease_remaining_at_start
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
-                p.id,
-                p.status.to_string(),
-                p.sprint_name,
-                p.description,
-                p.provider_name,
-                serde_json::to_string(&p.resource_request)?,
-                p.config.to_string(),
-                p.budget_cap_usd,
-                p.estimated_minutes,
-                p.tags.to_string(),
-                p.provider_job_id,
-                p.created_at,
-                p.approved_at,
-                p.dispatched_at,
-                p.started_at,
-                p.ended_at,
-                p.result_payload.as_ref().map(|v| v.to_string()),
-                p.error,
-                p.kill_reason,
-                p.lease_id,
-                p.runtime_seconds,
-                p.lease_remaining_at_start,
+                job.id,
+                job.status.to_string(),
+                job.sprint_name,
+                job.description,
+                job.provider_name,
+                serde_json::to_string(&job.resource_request)?,
+                job.config.to_string(),
+                job.budget_cap_usd,
+                job.estimated_minutes,
+                job.tags.to_string(),
+                job.provider_job_id,
+                job.created_at,
+                job.dispatched_at,
+                job.started_at,
+                job.ended_at,
+                job.result_payload.as_ref().map(|v| v.to_string()),
+                job.error,
+                job.kill_reason,
+                job.lease_id,
+                job.runtime_seconds,
+                job.lease_remaining_at_start,
             ],
         )?;
         Ok(())
     }
 
-    pub fn get_proposal(&self, id: &str) -> anyhow::Result<Option<Proposal>> {
+    pub fn get_job(&self, id: &str) -> anyhow::Result<Option<Job>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, status, sprint_name, description, provider_name,
                     resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                    provider_job_id, created_at, approved_at, dispatched_at,
+                    provider_job_id, created_at, dispatched_at,
                     started_at, ended_at, result_payload, error, kill_reason,
                     lease_id, runtime_seconds, lease_remaining_at_start
-             FROM proposals WHERE id = ?1",
+             FROM jobs WHERE id = ?1",
         )?;
         let result = stmt
-            .query_row(params![id], |row| Ok(row_to_proposal(row)))
+            .query_row(params![id], |row| Ok(row_to_job(row)))
             .optional()?;
         match result {
-            Some(Ok(p)) => Ok(Some(p)),
+            Some(Ok(j)) => Ok(Some(j)),
             Some(Err(e)) => Err(e),
             None => Ok(None),
         }
     }
 
-    pub fn list_proposals(&self, status_filter: Option<&str>) -> anyhow::Result<Vec<Proposal>> {
+    pub fn list_jobs(&self, status_filter: Option<&str>) -> anyhow::Result<Vec<Job>> {
         let conn = self.conn.lock().unwrap();
-        let mut proposals = Vec::new();
+        let mut jobs = Vec::new();
 
         if let Some(status) = status_filter {
             let mut stmt = conn.prepare(
                 "SELECT id, status, sprint_name, description, provider_name,
                         resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                        provider_job_id, created_at, approved_at, dispatched_at,
+                        provider_job_id, created_at, dispatched_at,
                         started_at, ended_at, result_payload, error, kill_reason,
                         lease_id, runtime_seconds, lease_remaining_at_start
-                 FROM proposals WHERE status = ?1 ORDER BY created_at DESC",
+                 FROM jobs WHERE status = ?1 ORDER BY created_at DESC",
             )?;
-            let rows = stmt.query_map(params![status], |row| Ok(row_to_proposal(row)))?;
+            let rows = stmt.query_map(params![status], |row| Ok(row_to_job(row)))?;
             for row in rows {
-                proposals.push(row??);
+                jobs.push(row??);
             }
         } else {
             let mut stmt = conn.prepare(
                 "SELECT id, status, sprint_name, description, provider_name,
                         resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                        provider_job_id, created_at, approved_at, dispatched_at,
+                        provider_job_id, created_at, dispatched_at,
                         started_at, ended_at, result_payload, error, kill_reason,
                         lease_id, runtime_seconds, lease_remaining_at_start
-                 FROM proposals ORDER BY created_at DESC",
+                 FROM jobs ORDER BY created_at DESC",
             )?;
-            let rows = stmt.query_map([], |row| Ok(row_to_proposal(row)))?;
+            let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
             for row in rows {
-                proposals.push(row??);
+                jobs.push(row??);
             }
         }
 
-        Ok(proposals)
+        Ok(jobs)
     }
 
-    pub fn update_proposal_status(
-        &self,
-        id: &str,
-        new_status: &ProposalStatus,
-    ) -> anyhow::Result<()> {
+    pub fn set_job_running(&self, id: &str, provider_job_id: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE proposals SET status = ?1 WHERE id = ?2",
-            params![new_status.to_string(), id],
-        )?;
-        Ok(())
-    }
-
-    pub fn approve_proposal(&self, id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE proposals SET status = 'approved', approved_at = ?1 WHERE id = ?2 AND status = 'pending'",
-            params![now(), id],
-        )?;
-        Ok(())
-    }
-
-    pub fn reject_proposal(&self, id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE proposals SET status = 'rejected' WHERE id = ?1 AND status = 'pending'",
-            params![id],
-        )?;
-        Ok(())
-    }
-
-    pub fn set_dispatching(&self, id: &str, provider_job_id: &str) -> anyhow::Result<()> {
-        let conn = self.conn.lock().unwrap();
-        conn.execute(
-            "UPDATE proposals SET status = 'running', provider_job_id = ?1, dispatched_at = ?2, started_at = ?2 WHERE id = ?3",
+            "UPDATE jobs SET status = 'running', provider_job_id = ?1, dispatched_at = ?2, started_at = ?2 WHERE id = ?3",
             params![provider_job_id, now(), id],
         )?;
         Ok(())
     }
 
-    pub fn complete_proposal(
+    pub fn complete_job(
         &self,
         id: &str,
         result_payload: Option<&serde_json::Value>,
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE proposals SET status = 'completed', ended_at = ?1, result_payload = ?2 WHERE id = ?3",
+            "UPDATE jobs SET status = 'completed', ended_at = ?1, result_payload = ?2 WHERE id = ?3",
             params![now(), result_payload.map(|v| v.to_string()), id],
         )?;
         Ok(())
     }
 
-    pub fn fail_proposal(&self, id: &str, error: &str) -> anyhow::Result<()> {
+    pub fn fail_job(&self, id: &str, error: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE proposals SET status = 'failed', ended_at = ?1, error = ?2 WHERE id = ?3",
+            "UPDATE jobs SET status = 'failed', ended_at = ?1, error = ?2 WHERE id = ?3",
             params![now(), error, id],
         )?;
         Ok(())
     }
 
-    pub fn kill_proposal(&self, id: &str, reason: &str) -> anyhow::Result<()> {
+    pub fn kill_job(&self, id: &str, reason: &str) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE proposals SET status = 'killed', ended_at = ?1, kill_reason = ?2 WHERE id = ?3",
+            "UPDATE jobs SET status = 'killed', ended_at = ?1, kill_reason = ?2 WHERE id = ?3",
             params![now(), reason, id],
         )?;
         Ok(())
@@ -300,12 +283,12 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         conn.execute(
             "INSERT INTO cost_ledger (
-                id, proposal_id, provider_name, gpu_type, gpu_count,
+                id, job_id, provider_name, gpu_type, gpu_count,
                 gpu_seconds, rate_per_gpu_second, computed_cost_usd, recorded_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 entry.id,
-                entry.proposal_id,
+                entry.job_id,
                 entry.provider_name,
                 entry.gpu_type,
                 entry.gpu_count,
@@ -428,7 +411,7 @@ impl Store {
         let conn = self.conn.lock().unwrap();
         let runtime: f64 = conn.query_row(
             "SELECT COALESCE(SUM(COALESCE(ended_at, ?1) - started_at), 0.0)
-             FROM proposals
+             FROM jobs
              WHERE lease_id = ?2
                AND started_at IS NOT NULL
                AND status IN ('running', 'completed', 'failed', 'killed')",
@@ -442,34 +425,34 @@ impl Store {
     pub fn count_running_jobs_for_provider(&self, provider_name: &str) -> anyhow::Result<u32> {
         let conn = self.conn.lock().unwrap();
         let count: u32 = conn.query_row(
-            "SELECT COUNT(*) FROM proposals WHERE provider_name = ?1 AND status = 'running'",
+            "SELECT COUNT(*) FROM jobs WHERE provider_name = ?1 AND status = 'running'",
             params![provider_name],
             |row| row.get(0),
         )?;
         Ok(count)
     }
 
-    /// List all proposals belonging to a lease.
-    pub fn list_proposals_for_lease(&self, lease_id: &str) -> anyhow::Result<Vec<Proposal>> {
+    /// List all jobs belonging to a lease.
+    pub fn list_jobs_for_lease(&self, lease_id: &str) -> anyhow::Result<Vec<Job>> {
         let conn = self.conn.lock().unwrap();
         let mut stmt = conn.prepare(
             "SELECT id, status, sprint_name, description, provider_name,
                     resource_request, config, budget_cap_usd, estimated_minutes, tags,
-                    provider_job_id, created_at, approved_at, dispatched_at,
+                    provider_job_id, created_at, dispatched_at,
                     started_at, ended_at, result_payload, error, kill_reason,
                     lease_id, runtime_seconds, lease_remaining_at_start
-             FROM proposals WHERE lease_id = ?1 ORDER BY created_at DESC",
+             FROM jobs WHERE lease_id = ?1 ORDER BY created_at DESC",
         )?;
-        let rows = stmt.query_map(params![lease_id], |row| Ok(row_to_proposal(row)))?;
-        let mut proposals = Vec::new();
+        let rows = stmt.query_map(params![lease_id], |row| Ok(row_to_job(row)))?;
+        let mut jobs = Vec::new();
         for row in rows {
-            proposals.push(row??);
+            jobs.push(row??);
         }
-        Ok(proposals)
+        Ok(jobs)
     }
 
-    /// Kill a proposal with lease expiry details.
-    pub fn kill_proposal_lease_exceeded(
+    /// Kill a job with lease expiry details.
+    pub fn kill_job_lease_exceeded(
         &self,
         id: &str,
         runtime_seconds: f64,
@@ -477,7 +460,7 @@ impl Store {
     ) -> anyhow::Result<()> {
         let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE proposals SET status = 'killed', ended_at = ?1, kill_reason = 'lease_time_exceeded',
+            "UPDATE jobs SET status = 'killed', ended_at = ?1, kill_reason = 'lease_time_exceeded',
              runtime_seconds = ?2, lease_remaining_at_start = ?3 WHERE id = ?4",
             params![now(), runtime_seconds, lease_remaining_at_start, id],
         )?;
@@ -527,14 +510,14 @@ fn row_to_lease(row: &rusqlite::Row) -> anyhow::Result<Lease> {
     })
 }
 
-fn row_to_proposal(row: &rusqlite::Row) -> anyhow::Result<Proposal> {
+fn row_to_job(row: &rusqlite::Row) -> anyhow::Result<Job> {
     let status_str: String = row.get(1)?;
     let rr_str: String = row.get(5)?;
     let config_str: String = row.get(6)?;
     let tags_str: String = row.get(9)?;
-    let result_str: Option<String> = row.get(16)?;
+    let result_str: Option<String> = row.get(15)?;
 
-    Ok(Proposal {
+    Ok(Job {
         id: row.get(0)?,
         status: serde_json::from_value(serde_json::Value::String(status_str))?,
         sprint_name: row.get(2)?,
@@ -547,15 +530,14 @@ fn row_to_proposal(row: &rusqlite::Row) -> anyhow::Result<Proposal> {
         tags: serde_json::from_str(&tags_str)?,
         provider_job_id: row.get(10)?,
         created_at: row.get(11)?,
-        approved_at: row.get(12)?,
-        dispatched_at: row.get(13)?,
-        started_at: row.get(14)?,
-        ended_at: row.get(15)?,
+        dispatched_at: row.get(12)?,
+        started_at: row.get(13)?,
+        ended_at: row.get(14)?,
         result_payload: result_str.map(|s| serde_json::from_str(&s)).transpose()?,
-        error: row.get(17)?,
-        kill_reason: row.get(18)?,
-        lease_id: row.get(19)?,
-        runtime_seconds: row.get(20)?,
-        lease_remaining_at_start: row.get(21)?,
+        error: row.get(16)?,
+        kill_reason: row.get(17)?,
+        lease_id: row.get(18)?,
+        runtime_seconds: row.get(19)?,
+        lease_remaining_at_start: row.get(20)?,
     })
 }
