@@ -77,11 +77,13 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Start dispatcher
+    let concurrency_limits = config.concurrency_limits();
     let dispatcher = Arc::new(dispatcher::Dispatcher::new(
         store.clone(),
         Arc::clone(&budget),
         Arc::clone(&bridge),
         config.harness.poll_interval_seconds,
+        concurrency_limits.clone(),
     ));
     let paused_flag = dispatcher.paused_flag();
 
@@ -98,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
         paused: paused_flag,
         agent_token: config.harness.agent_token.clone(),
         admin_token: config.harness.admin_token.clone(),
+        concurrency_limits,
     };
     let app = api::router(state);
 

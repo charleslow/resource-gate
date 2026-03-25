@@ -1,4 +1,4 @@
-// Budget enforcement: per-job caps, daily limits, agent ceiling
+// Budget enforcement: per-job caps, daily limits, lease time gates
 
 use crate::config::BudgetConfig;
 use crate::store::Store;
@@ -13,7 +13,7 @@ impl BudgetEnforcer {
         Self { config, store }
     }
 
-    /// Check if a new proposal with the given budget cap can be accepted
+    /// Check if a new job with the given budget cap can be accepted
     /// without exceeding the daily limit. A daily_limit_usd of 0 means unlimited.
     pub fn can_accept(&self, budget_cap_usd: f64) -> anyhow::Result<BudgetCheck> {
         // 0 means unlimited — always accept
@@ -67,6 +67,45 @@ impl BudgetEnforcer {
     pub fn daily_spent(&self) -> anyhow::Result<f64> {
         self.store.daily_spend()
     }
+
+    /// Check if a lease is approved and has time remaining for new jobs.
+    /// This is the single gate for job submission.
+    pub fn lease_has_time(&self, lease_id: &str, now_ts: f64) -> anyhow::Result<LeaseTimeCheck> {
+        let lease = self.store.get_lease(lease_id)?;
+        let lease = match lease {
+            Some(l) => l,
+            None => {
+                return Ok(LeaseTimeCheck::Rejected {
+                    reason: format!("lease {} not found", lease_id),
+                })
+            }
+        };
+
+        if lease.status != crate::models::LeaseStatus::Approved {
+            return Ok(LeaseTimeCheck::Rejected {
+                reason: format!("lease {} is {}, not approved", lease_id, lease.status),
+            });
+        }
+
+        let used = self.store.cumulative_runtime_for_lease(lease_id, now_ts)?;
+        let remaining = lease.duration_seconds as f64 - used;
+
+        if remaining <= 0.0 {
+            Ok(LeaseTimeCheck::Rejected {
+                reason: format!(
+                    "lease {} has no time remaining ({:.0}s used of {}s)",
+                    lease_id, used, lease.duration_seconds
+                ),
+            })
+        } else {
+            Ok(LeaseTimeCheck::Accepted { remaining_seconds: remaining })
+        }
+    }
+}
+
+pub enum LeaseTimeCheck {
+    Accepted { remaining_seconds: f64 },
+    Rejected { reason: String },
 }
 
 pub enum BudgetCheck {

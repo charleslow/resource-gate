@@ -48,6 +48,12 @@ pub struct ProvidersConfig {
 pub struct LocalProviderConfig {
     #[serde(default = "default_true")]
     pub enabled: bool,
+    #[serde(default = "default_max_concurrent_local")]
+    pub max_concurrent_jobs: u32,
+}
+
+fn default_max_concurrent_local() -> u32 {
+    1
 }
 
 fn default_host() -> String {
@@ -108,5 +114,18 @@ impl Config {
             .python_bin
             .as_deref()
             .unwrap_or("python3")
+    }
+
+    /// Return per-provider concurrency limits as a map.
+    pub fn concurrency_limits(&self) -> std::collections::HashMap<String, u32> {
+        let mut limits = std::collections::HashMap::new();
+        let local_limit = self
+            .providers
+            .local
+            .as_ref()
+            .map(|l| l.max_concurrent_jobs)
+            .unwrap_or(default_max_concurrent_local());
+        limits.insert("local".to_string(), local_limit);
+        limits
     }
 }
