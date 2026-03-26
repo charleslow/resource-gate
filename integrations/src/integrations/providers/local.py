@@ -1,8 +1,10 @@
 """LocalProvider — runs sprint jobs as Docker containers on the host machine.
 
-launch() → docker run (detached) with resource limits and shared workspace
+launch() → docker create + docker cp + docker start (copy-based, no bind mounts)
 poll()   → docker inspect to check container status
 cancel() → docker kill
+copy_in()  → docker cp local → container
+copy_out() → docker cp container → local
 
 Note: Containers are NOT launched with --rm.  We need to inspect them after
 exit to read exit code / OOM status, so auto-removal would race with the
@@ -69,7 +71,7 @@ class LocalProvider:
     async def launch(
         self, request: ResourceRequest, config: SprintConfig, workspace_dir: str
     ) -> JobHandle:
-        """Start a Docker container for the sprint."""
+        """Create a Docker container, copy workspace in, then start it."""
         if not config.command:
             raise ValueError("config.command is required for local provider")
 
@@ -77,8 +79,8 @@ class LocalProvider:
         if not image:
             raise ValueError("resource_request.docker_image is required for local provider")
 
-        # Build docker run command (no --rm: we clean up after reading exit status)
-        cmd = ["docker", "run", "-d"]
+        # Build docker create command (container is created but not started)
+        cmd = ["docker", "create"]
 
         # Resource limits
         if request.cpu_cores:
@@ -92,9 +94,6 @@ class LocalProvider:
                 cmd += ["--gpus", f'"device={",".join(str(i) for i in range(request.gpu_count))}"']
             else:
                 cmd += ["--gpus", "all"]
-
-        # Mount shared workspace
-        cmd += ["-v", f"{workspace_dir}:/workspace"]
 
         # Working directory
         work_dir = config.working_dir or "/workspace"
@@ -113,9 +112,26 @@ class LocalProvider:
 
         rc, stdout, stderr = await _run(cmd)
         if rc != 0:
-            raise RuntimeError(f"docker run failed: {stderr}")
+            raise RuntimeError(f"docker create failed: {stderr}")
 
         container_id = stdout.strip()
+
+        # Copy workspace contents into the container before starting it.
+        # The trailing "/." copies the *contents* of workspace_dir into /workspace.
+        rc, _, stderr = await _run(
+            ["docker", "cp", f"{workspace_dir}/.", f"{container_id}:/workspace"]
+        )
+        if rc != 0:
+            # Clean up the created-but-not-started container
+            await _run(["docker", "rm", "-f", container_id])
+            raise RuntimeError(f"docker cp (copy-in workspace) failed: {stderr}")
+
+        # Now start the container
+        rc, _, stderr = await _run(["docker", "start", container_id])
+        if rc != 0:
+            await _run(["docker", "rm", "-f", container_id])
+            raise RuntimeError(f"docker start failed: {stderr}")
+
         return JobHandle(
             provider_name="local",
             provider_job_id=container_id,
@@ -140,7 +156,7 @@ class LocalProvider:
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
                 error="container not found — may have been removed externally",
-                artifacts_path="/workspace",
+                artifacts_path=None,
             )
 
         state = json.loads(stdout)
@@ -159,7 +175,7 @@ class LocalProvider:
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
                 error="container entered 'dead' state — Docker daemon error",
-                artifacts_path="/workspace",
+                artifacts_path=None,
             )
 
         # Container exited — use Docker's actual timestamps
@@ -181,7 +197,7 @@ class LocalProvider:
                 gpu_seconds=ended_at - started_at,
                 result_payload={"exit_code": exit_code},
                 error=None,
-                artifacts_path="/workspace",
+                artifacts_path=None,
             )
         else:
             # Get logs for error context before removing the container
@@ -202,7 +218,7 @@ class LocalProvider:
                 gpu_seconds=ended_at - started_at,
                 result_payload={"exit_code": exit_code, "oom_killed": oom_killed},
                 error=error_msg,
-                artifacts_path="/workspace",
+                artifacts_path=None,
             )
 
     async def cancel(self, handle: JobHandle) -> None:
@@ -211,6 +227,24 @@ class LocalProvider:
         await _run(["docker", "kill", container_id])
         await _run(["docker", "rm", "-f", container_id])
 
-    async def get_artifacts(self, handle: JobHandle, local_dest: str) -> None:
-        """No-op — workspace is already a shared volume on the host."""
-        pass
+    async def copy_in(
+        self, handle: JobHandle, local_path: str, remote_path: str
+    ) -> None:
+        """Copy a local file or directory into the Docker container."""
+        container_id = handle.provider_job_id
+        rc, _, stderr = await _run(
+            ["docker", "cp", local_path, f"{container_id}:{remote_path}"]
+        )
+        if rc != 0:
+            raise RuntimeError(f"docker cp (copy-in) failed: {stderr}")
+
+    async def copy_out(
+        self, handle: JobHandle, remote_path: str, local_path: str
+    ) -> None:
+        """Copy a file or directory from the Docker container to local."""
+        container_id = handle.provider_job_id
+        rc, _, stderr = await _run(
+            ["docker", "cp", f"{container_id}:{remote_path}", local_path]
+        )
+        if rc != 0:
+            raise RuntimeError(f"docker cp (copy-out) failed: {stderr}")

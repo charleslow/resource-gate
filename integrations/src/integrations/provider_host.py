@@ -84,10 +84,18 @@ async def handle_command(cmd: dict) -> dict:
         await provider.cancel(handle)
         return {"type": "ok", "data": None}
 
-    elif method == "get_artifacts":
+    elif method == "copy_in":
         handle = JobHandle(**cmd["handle"])
-        local_dest = cmd["local_dest"]
-        await provider.get_artifacts(handle, local_dest)
+        local_path = cmd["local_path"]
+        remote_path = cmd["remote_path"]
+        await provider.copy_in(handle, local_path, remote_path)
+        return {"type": "ok", "data": None}
+
+    elif method == "copy_out":
+        handle = JobHandle(**cmd["handle"])
+        remote_path = cmd["remote_path"]
+        local_path = cmd["local_path"]
+        await provider.copy_out(handle, remote_path, local_path)
         return {"type": "ok", "data": None}
 
     else:

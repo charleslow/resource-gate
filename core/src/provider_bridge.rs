@@ -133,4 +133,40 @@ impl ProviderBridge {
         let resp = self.call(cmd).await?;
         Ok(resp["data"].clone())
     }
+
+    pub async fn copy_in(
+        &self,
+        provider: &str,
+        handle: &JobHandle,
+        local_path: &str,
+        remote_path: &str,
+    ) -> anyhow::Result<()> {
+        let cmd = serde_json::json!({
+            "method": "copy_in",
+            "provider": provider,
+            "handle": handle,
+            "local_path": local_path,
+            "remote_path": remote_path,
+        });
+        self.call(cmd).await?;
+        Ok(())
+    }
+
+    pub async fn copy_out(
+        &self,
+        provider: &str,
+        handle: &JobHandle,
+        remote_path: &str,
+        local_path: &str,
+    ) -> anyhow::Result<()> {
+        let cmd = serde_json::json!({
+            "method": "copy_out",
+            "provider": provider,
+            "handle": handle,
+            "remote_path": remote_path,
+            "local_path": local_path,
+        });
+        self.call(cmd).await?;
+        Ok(())
+    }
 }

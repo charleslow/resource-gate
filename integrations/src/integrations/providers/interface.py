@@ -80,6 +80,11 @@ class ComputeProvider(Protocol):
     ) -> JobHandle:
         """Launch a job and return a handle the orchestrator can use to track it.
 
+        The workspace_dir contents are copied (not mounted) into the job
+        environment at /workspace before execution starts.  This ensures a
+        consistent copy-based interface across all providers — local Docker,
+        Modal, RunPod, etc.
+
         The returned :class:`JobHandle` must contain a ``provider_job_id`` that
         is an opaque string token.  The orchestrator stores it in SQLite and
         passes it back verbatim to :meth:`poll` and :meth:`cancel` — it never
@@ -93,4 +98,14 @@ class ComputeProvider(Protocol):
 
     async def cancel(self, handle: JobHandle) -> None: ...
 
-    async def get_artifacts(self, handle: JobHandle, local_dest: str) -> None: ...
+    async def copy_in(
+        self, handle: JobHandle, local_path: str, remote_path: str
+    ) -> None:
+        """Copy a local file or directory into the running job environment."""
+        ...
+
+    async def copy_out(
+        self, handle: JobHandle, remote_path: str, local_path: str
+    ) -> None:
+        """Copy a file or directory from the job environment to a local path."""
+        ...
