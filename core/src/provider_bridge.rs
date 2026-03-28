@@ -8,7 +8,6 @@ use tokio::process::Command;
 
 use crate::models::{JobHandle, JobResult, ResourceRequest};
 
-/// The response types we can get back from the Python provider host.
 #[derive(Debug)]
 pub enum ProviderResponse {
     Handle(JobHandle),
@@ -27,11 +26,7 @@ pub struct ProviderBridge {
 
 impl ProviderBridge {
     pub fn new(python_bin: String, integrations_path: String, workspace_dir: String) -> Self {
-        Self {
-            python_bin,
-            integrations_path,
-            workspace_dir,
-        }
+        Self { python_bin, integrations_path, workspace_dir }
     }
 
     async fn call(&self, command: serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -45,138 +40,83 @@ impl ProviderBridge {
             .spawn()?;
 
         let stdin = child.stdin.as_mut().unwrap();
-        stdin
-            .write_all(serde_json::to_string(&command)?.as_bytes())
-            .await?;
+        stdin.write_all(serde_json::to_string(&command)?.as_bytes()).await?;
         stdin.shutdown().await?;
 
         let output = child.wait_with_output().await?;
-
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            anyhow::bail!("provider process failed: {}", stderr);
+            anyhow::bail!("provider process failed: {}", String::from_utf8_lossy(&output.stderr));
         }
 
-        let stdout = String::from_utf8(output.stdout)?;
-        let response: serde_json::Value = serde_json::from_str(&stdout)?;
-
+        let response: serde_json::Value = serde_json::from_str(&String::from_utf8(output.stdout)?)?;
         if let Some(err) = response.get("error") {
             anyhow::bail!("provider error: {}", err);
         }
-
         Ok(response)
     }
 
+    /// Fire-and-forget call that only checks for errors.
+    async fn call_void(&self, command: serde_json::Value) -> anyhow::Result<()> {
+        self.call(command).await?;
+        Ok(())
+    }
+
     pub async fn launch(
-        &self,
-        provider: &str,
-        request: &ResourceRequest,
-        config: &serde_json::Value,
+        &self, provider: &str, request: &ResourceRequest, config: &serde_json::Value,
     ) -> anyhow::Result<JobHandle> {
-        let cmd = serde_json::json!({
-            "method": "launch",
-            "provider": provider,
-            "request": request,
-            "config": config,
+        let resp = self.call(serde_json::json!({
+            "method": "launch", "provider": provider,
+            "request": request, "config": config,
             "workspace_dir": self.workspace_dir,
-        });
-        let resp = self.call(cmd).await?;
-        let data = &resp["data"];
-        Ok(serde_json::from_value(data.clone())?)
+        })).await?;
+        Ok(serde_json::from_value(resp["data"].clone())?)
     }
 
     pub async fn poll(&self, provider: &str, handle: &JobHandle) -> anyhow::Result<ProviderResponse> {
-        let cmd = serde_json::json!({
-            "method": "poll",
-            "provider": provider,
-            "handle": handle,
-        });
-        let resp = self.call(cmd).await?;
-        let resp_type = resp["type"].as_str().unwrap_or("");
-        match resp_type {
-            "status" => {
-                let status = resp["data"]["status"].as_str().unwrap_or("running");
-                Ok(ProviderResponse::Status(status.to_string()))
-            }
-            "result" => {
-                let result: JobResult = serde_json::from_value(resp["data"].clone())?;
-                Ok(ProviderResponse::Result(result))
-            }
+        let resp = self.call(serde_json::json!({
+            "method": "poll", "provider": provider, "handle": handle,
+        })).await?;
+        match resp["type"].as_str().unwrap_or("") {
+            "status" => Ok(ProviderResponse::Status(
+                resp["data"]["status"].as_str().unwrap_or("running").to_string(),
+            )),
+            "result" => Ok(ProviderResponse::Result(serde_json::from_value(resp["data"].clone())?)),
             _ => Ok(ProviderResponse::Status("running".to_string())),
         }
     }
 
     pub async fn cancel(&self, provider: &str, handle: &JobHandle) -> anyhow::Result<()> {
-        let cmd = serde_json::json!({
-            "method": "cancel",
-            "provider": provider,
-            "handle": handle,
-        });
-        self.call(cmd).await?;
-        Ok(())
-    }
-
-    pub async fn preflight(&self, provider: &str) -> anyhow::Result<()> {
-        let cmd = serde_json::json!({
-            "method": "preflight",
-            "provider": provider,
-        });
-        self.call(cmd).await?;
-        Ok(())
-    }
-
-    pub async fn capabilities(&self, provider: &str) -> anyhow::Result<serde_json::Value> {
-        let cmd = serde_json::json!({
-            "method": "capabilities",
-            "provider": provider,
-        });
-        let resp = self.call(cmd).await?;
-        Ok(resp["data"].clone())
+        self.call_void(serde_json::json!({"method": "cancel", "provider": provider, "handle": handle})).await
     }
 
     pub async fn cleanup(&self, provider: &str, handle: &JobHandle) -> anyhow::Result<()> {
-        let cmd = serde_json::json!({
-            "method": "cleanup",
-            "provider": provider,
-            "handle": handle,
-        });
-        self.call(cmd).await?;
-        Ok(())
+        self.call_void(serde_json::json!({"method": "cleanup", "provider": provider, "handle": handle})).await
+    }
+
+    pub async fn preflight(&self, provider: &str) -> anyhow::Result<()> {
+        self.call_void(serde_json::json!({"method": "preflight", "provider": provider})).await
+    }
+
+    pub async fn capabilities(&self, provider: &str) -> anyhow::Result<serde_json::Value> {
+        let resp = self.call(serde_json::json!({"method": "capabilities", "provider": provider})).await?;
+        Ok(resp["data"].clone())
     }
 
     pub async fn copy_in(
-        &self,
-        provider: &str,
-        handle: &JobHandle,
-        local_path: &str,
-        remote_path: &str,
+        &self, provider: &str, handle: &JobHandle, local_path: &str, remote_path: &str,
     ) -> anyhow::Result<()> {
-        let cmd = serde_json::json!({
-            "method": "copy_in",
-            "provider": provider,
-            "handle": handle,
-            "local_path": local_path,
-            "remote_path": remote_path,
-        });
-        self.call(cmd).await?;
-        Ok(())
+        self.call_void(serde_json::json!({
+            "method": "copy_in", "provider": provider, "handle": handle,
+            "local_path": local_path, "remote_path": remote_path,
+        })).await
     }
 
     pub async fn copy_out(
-        &self,
-        provider: &str,
-        handle: &JobHandle,
-        remote_path: &str,
-        local_path: &str,
+        &self, provider: &str, handle: &JobHandle, remote_path: &str, local_path: &str,
     ) -> anyhow::Result<()> {
-        let cmd = serde_json::json!({
-            "method": "copy_out",
-            "provider": provider,
-            "handle": handle,
-            "remote_path": remote_path,
-            "local_path": local_path,
-        });
-        self.call(cmd).await?;
-        Ok(())
+        self.call_void(serde_json::json!({
+            "method": "copy_out", "provider": provider, "handle": handle,
+            "remote_path": remote_path, "local_path": local_path,
+        })).await
     }
 }
