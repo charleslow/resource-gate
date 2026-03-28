@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::budget::BudgetEnforcer;
+use crate::dispatcher::Dispatcher;
 use crate::models::*;
 use crate::provider_bridge::ProviderBridge;
 use crate::store::{JobInsertError, Store};
@@ -33,6 +34,7 @@ pub struct AppState {
     pub store: Store,
     pub budget: Arc<BudgetEnforcer>,
     pub bridge: Arc<ProviderBridge>,
+    pub dispatcher: Arc<Dispatcher>,
     pub paused: Arc<AtomicBool>,
     pub agent_token: Option<String>,
     pub admin_token: Option<String>,
@@ -118,6 +120,8 @@ pub fn router(state: AppState) -> Router {
         .route("/leases/{id}", get(get_lease))
         .route("/budget", get(get_budget))
         .route("/providers", get(list_providers))
+        .route("/jobs/{id}/copy-in", post(copy_in))
+        .route("/jobs/{id}/copy-out", post(copy_out))
         .route("/system/status", get(system_status))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -378,6 +382,116 @@ async fn cancel_job(
                 }
             }
             Json(serde_json::json!({"status": "cancelled"})).into_response()
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+// -- Copy in/out --
+
+#[derive(Deserialize)]
+struct CopyRequest {
+    local_path: String,
+    remote_path: String,
+}
+
+async fn copy_in(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CopyRequest>,
+) -> impl IntoResponse {
+    match state.store.get_job(&id) {
+        Ok(Some(j)) => {
+            let provider_job_id = match j.provider_job_id {
+                Some(ref pjid) => pjid.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "job has no provider resources"})),
+                    )
+                        .into_response();
+                }
+            };
+            let handle = JobHandle {
+                provider_name: j.provider_name.clone(),
+                provider_job_id,
+                launched_at: j.dispatched_at.unwrap_or(0.0),
+            };
+            match state
+                .bridge
+                .copy_in(&j.provider_name, &handle, &req.local_path, &req.remote_path)
+                .await
+            {
+                Ok(()) => {
+                    state.dispatcher.reset_cleanup_grace(&id);
+                    Json(serde_json::json!({"status": "ok"})).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
+        }
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({"error": "not found"})),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+async fn copy_out(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CopyRequest>,
+) -> impl IntoResponse {
+    match state.store.get_job(&id) {
+        Ok(Some(j)) => {
+            let provider_job_id = match j.provider_job_id {
+                Some(ref pjid) => pjid.clone(),
+                None => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": "job has no provider resources"})),
+                    )
+                        .into_response();
+                }
+            };
+            let handle = JobHandle {
+                provider_name: j.provider_name.clone(),
+                provider_job_id,
+                launched_at: j.dispatched_at.unwrap_or(0.0),
+            };
+            match state
+                .bridge
+                .copy_out(&j.provider_name, &handle, &req.remote_path, &req.local_path)
+                .await
+            {
+                Ok(()) => {
+                    state.dispatcher.reset_cleanup_grace(&id);
+                    Json(serde_json::json!({"status": "ok"})).into_response()
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": e.to_string()})),
+                )
+                    .into_response(),
+            }
         }
         Ok(None) => (
             StatusCode::NOT_FOUND,

@@ -63,6 +63,34 @@ impl Dispatcher {
         self.paused.load(Ordering::Relaxed)
     }
 
+    /// Recover cleanup state after a restart.  Terminal jobs whose provider
+    /// resources are still present (provider_job_id IS NOT NULL) are scheduled
+    /// for immediate cleanup — their grace period has long since elapsed.
+    fn recover_stale_cleanups(&self) {
+        match self.store.list_jobs_needing_cleanup() {
+            Ok(jobs) if jobs.is_empty() => {}
+            Ok(jobs) => {
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs_f64();
+                let count = jobs.len();
+                if let Ok(mut deadlines) = self.cleanup_deadlines.lock() {
+                    for job in jobs {
+                        deadlines.entry(job.id).or_insert(now); // due immediately
+                    }
+                }
+                tracing::info!(
+                    "recovered {} stale job(s) needing provider cleanup",
+                    count
+                );
+            }
+            Err(e) => {
+                tracing::error!("failed to query stale jobs for cleanup: {}", e);
+            }
+        }
+    }
+
     /// Run the dispatch loop.
     ///
     /// Job completion is detected exclusively via polling (provider `poll()`),
@@ -72,6 +100,8 @@ impl Dispatcher {
     /// container exits.  If faster detection is needed, increase the polling
     /// frequency rather than introducing wait-based shortcuts.
     pub async fn run(self: Arc<Self>) {
+        self.recover_stale_cleanups();
+
         let mut ticker = interval(self.poll_interval);
         tracing::info!(
             "dispatcher started, polling every {}s",
@@ -152,6 +182,10 @@ impl Dispatcher {
                         tracing::warn!("cleanup failed for job {}: {}", job_id, e);
                         // Don't remove from deadlines — retry next tick
                         continue;
+                    }
+                    // Mark in DB so this job won't appear in future startup sweeps
+                    if let Err(e) = self.store.mark_job_cleaned_up(job_id) {
+                        tracing::warn!("failed to mark job {} as cleaned up: {}", job_id, e);
                     }
                     tracing::info!("cleaned up job {} (provider resources removed)", job_id);
                 }
