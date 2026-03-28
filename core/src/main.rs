@@ -97,6 +97,7 @@ async fn main() -> anyhow::Result<()> {
         store,
         budget,
         bridge,
+        dispatcher,
         paused: paused_flag,
         agent_token: config.harness.agent_token.clone(),
         admin_token: config.harness.admin_token.clone(),

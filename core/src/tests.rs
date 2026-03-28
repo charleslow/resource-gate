@@ -8,6 +8,7 @@ use tower::ServiceExt;
 
 use crate::api::AppState;
 use crate::budget::{BudgetCheck, BudgetEnforcer, LeaseTimeCheck};
+use crate::dispatcher::Dispatcher;
 use crate::store::JobInsertError;
 use crate::config::BudgetConfig;
 use crate::models::*;
@@ -87,10 +88,18 @@ fn test_app_state(store: Store) -> AppState {
     ));
     let mut concurrency_limits = std::collections::HashMap::new();
     concurrency_limits.insert("local".to_string(), 4);
+    let dispatcher = Arc::new(Dispatcher::new(
+        store.clone(),
+        Arc::clone(&budget),
+        Arc::clone(&bridge),
+        30,
+        concurrency_limits.clone(),
+    ));
     AppState {
         store,
         budget,
         bridge,
+        dispatcher,
         paused: Arc::new(AtomicBool::new(false)),
         agent_token: Some("agent-secret".into()),
         admin_token: Some("admin-secret".into()),
@@ -288,8 +297,7 @@ async fn test_provider_response_parsing_result() {
             "ended_at": 1060.0,
             "gpu_seconds": 60.0,
             "result_payload": {"accuracy": 0.95},
-            "error": null,
-            "artifacts_path": "/workspace/out"
+            "error": null
         }
     });
 
@@ -321,8 +329,7 @@ async fn test_provider_response_parsing_failed_result() {
             "ended_at": 1010.0,
             "gpu_seconds": 10.0,
             "error": "OOMKilled",
-            "result_payload": null,
-            "artifacts_path": null
+            "result_payload": null
         }
     });
 

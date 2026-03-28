@@ -20,78 +20,69 @@ PROVIDERS = {
     "local": LocalProvider(),
 }
 
+OK = {"type": "ok", "data": None}
+
 
 def _serialize_response(obj) -> dict:
     """Convert provider response objects to JSON-serializable dicts."""
     if isinstance(obj, JobHandle):
         return {"type": "handle", "data": asdict(obj)}
-    elif isinstance(obj, JobStatus):
+    if isinstance(obj, JobStatus):
         return {"type": "status", "data": {"status": obj.value}}
-    elif hasattr(obj, "status") and hasattr(obj, "gpu_seconds"):
-        # JobResult
+    if hasattr(obj, "status") and hasattr(obj, "gpu_seconds"):
         d = asdict(obj)
         d["status"] = obj.status.value
         return {"type": "result", "data": d}
-    else:
-        return {"type": "ok", "data": None}
+    return OK
 
 
-def _parse_sprint_config(raw: dict | None) -> SprintConfig:
-    """Parse sprint config from JSON, handling missing fields."""
-    if not raw:
-        return SprintConfig()
-    return SprintConfig(
-        command=raw.get("command", []),
-        env=raw.get("env", {}),
-        working_dir=raw.get("working_dir"),
-    )
+def _parse_handle(cmd: dict) -> JobHandle:
+    return JobHandle(**cmd["handle"])
 
 
 async def handle_command(cmd: dict) -> dict:
     method = cmd["method"]
-    provider_name = cmd["provider"]
-
-    provider = PROVIDERS.get(provider_name)
+    provider = PROVIDERS.get(cmd["provider"])
     if provider is None:
-        return {"error": f"unknown provider: {provider_name}"}
+        return {"error": f"unknown provider: {cmd['provider']}"}
 
     if method == "preflight":
         await provider.preflight()
-        return {"type": "ok", "data": None}
+        return OK
 
-    elif method == "capabilities":
-        caps = provider.capabilities()
-        return {"type": "capabilities", "data": asdict(caps)}
+    if method == "capabilities":
+        return {"type": "capabilities", "data": asdict(provider.capabilities())}
 
-    elif method == "launch":
+    if method == "launch":
         req_data = cmd["request"]
         request = ResourceRequest(**{
             k: v for k, v in req_data.items()
             if k in ResourceRequest.__dataclass_fields__
         })
-        config = _parse_sprint_config(cmd.get("config"))
-        workspace_dir = cmd.get("workspace_dir", "/workspace")
-        handle = await provider.launch(request, config, workspace_dir)
+        config = SprintConfig(
+            command=(cmd.get("config") or {}).get("command", []),
+            env=(cmd.get("config") or {}).get("env", {}),
+            working_dir=(cmd.get("config") or {}).get("working_dir"),
+        )
+        handle = await provider.launch(request, config, cmd.get("workspace_dir", "/workspace"))
         return _serialize_response(handle)
 
-    elif method == "poll":
-        handle = JobHandle(**cmd["handle"])
-        result = await provider.poll(handle)
-        return _serialize_response(result)
+    if method == "poll":
+        return _serialize_response(await provider.poll(_parse_handle(cmd)))
 
-    elif method == "cancel":
-        handle = JobHandle(**cmd["handle"])
+    # Simple handle-based methods that return OK
+    handle = _parse_handle(cmd)
+    if method == "cancel":
         await provider.cancel(handle)
-        return {"type": "ok", "data": None}
-
-    elif method == "get_artifacts":
-        handle = JobHandle(**cmd["handle"])
-        local_dest = cmd["local_dest"]
-        await provider.get_artifacts(handle, local_dest)
-        return {"type": "ok", "data": None}
-
+    elif method == "cleanup":
+        await provider.cleanup(handle)
+    elif method == "copy_in":
+        await provider.copy_in(handle, cmd["local_path"], cmd["remote_path"])
+    elif method == "copy_out":
+        await provider.copy_out(handle, cmd["remote_path"], cmd["local_path"])
     else:
         return {"error": f"unknown method: {method}"}
+    return OK
 
 
 def main():

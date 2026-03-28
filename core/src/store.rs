@@ -423,6 +423,41 @@ impl Store {
         Ok(jobs)
     }
 
+    /// List terminal jobs (completed/failed/killed) that still have a
+    /// provider_job_id — i.e. their provider resources haven't been cleaned up.
+    pub fn list_jobs_needing_cleanup(&self) -> anyhow::Result<Vec<Job>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT id, status, sprint_name, description, provider_name,
+                    resource_request, config, budget_cap_usd, estimated_minutes, tags,
+                    provider_job_id, created_at, dispatched_at,
+                    started_at, ended_at, result_payload, error, kill_reason,
+                    lease_id, runtime_seconds, lease_remaining_at_start
+             FROM jobs
+             WHERE status IN ('completed', 'failed', 'killed')
+               AND provider_job_id IS NOT NULL
+             ORDER BY ended_at ASC",
+        )?;
+        let rows = stmt.query_map([], |row| Ok(row_to_job(row)))?;
+        let mut jobs = Vec::new();
+        for row in rows {
+            jobs.push(row??);
+        }
+        Ok(jobs)
+    }
+
+    /// Clear the provider_job_id for a job, marking its provider resources
+    /// as cleaned up.  After this, the job won't appear in
+    /// `list_jobs_needing_cleanup`.
+    pub fn mark_job_cleaned_up(&self, id: &str) -> anyhow::Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE jobs SET provider_job_id = NULL WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     /// Kill a job with lease expiry details.
     pub fn kill_job_lease_exceeded(
         &self,

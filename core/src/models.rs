@@ -147,7 +147,6 @@ pub struct JobResult {
     pub gpu_seconds: f64,
     pub result_payload: Option<serde_json::Value>,
     pub error: Option<String>,
-    pub artifacts_path: Option<String>,
 }
 
 /// Provider-specific sprint config (e.g. command, env vars, working_dir)
