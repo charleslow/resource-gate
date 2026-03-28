@@ -288,8 +288,7 @@ async fn test_provider_response_parsing_result() {
             "ended_at": 1060.0,
             "gpu_seconds": 60.0,
             "result_payload": {"accuracy": 0.95},
-            "error": null,
-            "artifacts_path": "/workspace/out"
+            "error": null
         }
     });
 
@@ -321,8 +320,7 @@ async fn test_provider_response_parsing_failed_result() {
             "ended_at": 1010.0,
             "gpu_seconds": 10.0,
             "error": "OOMKilled",
-            "result_payload": null,
-            "artifacts_path": null
+            "result_payload": null
         }
     });
 

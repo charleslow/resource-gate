@@ -134,6 +134,16 @@ impl ProviderBridge {
         Ok(resp["data"].clone())
     }
 
+    pub async fn cleanup(&self, provider: &str, handle: &JobHandle) -> anyhow::Result<()> {
+        let cmd = serde_json::json!({
+            "method": "cleanup",
+            "provider": provider,
+            "handle": handle,
+        });
+        self.call(cmd).await?;
+        Ok(())
+    }
+
     pub async fn copy_in(
         &self,
         provider: &str,

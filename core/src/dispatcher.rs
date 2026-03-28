@@ -17,6 +17,12 @@ use crate::models::*;
 use crate::provider_bridge::{ProviderBridge, ProviderResponse};
 use crate::store::Store;
 
+/// Grace period after a job reaches a terminal state before its provider
+/// resources (container, instance, etc.) are cleaned up.  This gives the
+/// agent time to call copy_out.  Each copy_in/copy_out call resets the
+/// timer (tracked via `cleanup_deadlines`).
+const CLEANUP_GRACE_SECS: f64 = 300.0; // 5 minutes
+
 pub struct Dispatcher {
     store: Store,
     budget: Arc<BudgetEnforcer>,
@@ -24,6 +30,10 @@ pub struct Dispatcher {
     poll_interval: Duration,
     paused: Arc<AtomicBool>,
     concurrency_limits: std::collections::HashMap<String, u32>,
+    /// job_id → deadline (epoch seconds) at which cleanup() will be called.
+    /// Inserted when a job transitions to a terminal state; removed after
+    /// cleanup fires.  copy_in/copy_out push the deadline forward.
+    cleanup_deadlines: std::sync::Mutex<std::collections::HashMap<String, f64>>,
 }
 
 impl Dispatcher {
@@ -41,6 +51,7 @@ impl Dispatcher {
             poll_interval: Duration::from_secs(poll_interval_secs),
             paused: Arc::new(AtomicBool::new(false)),
             concurrency_limits,
+            cleanup_deadlines: std::sync::Mutex::new(std::collections::HashMap::new()),
         }
     }
 
@@ -80,9 +91,77 @@ impl Dispatcher {
         }
     }
 
+    /// Reset the cleanup grace timer for a job.  Call this whenever a
+    /// copy_in or copy_out is performed so the container stays alive while
+    /// the agent is still transferring files.
+    pub fn reset_cleanup_grace(&self, job_id: &str) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        if let Ok(mut deadlines) = self.cleanup_deadlines.lock() {
+            if deadlines.contains_key(job_id) {
+                deadlines.insert(job_id.to_string(), now + CLEANUP_GRACE_SECS);
+                tracing::debug!("reset cleanup grace for job {}", job_id);
+            }
+        }
+    }
+
+    /// Schedule a job for cleanup after the grace period elapses.
+    fn schedule_cleanup(&self, job_id: &str, now: f64) {
+        if let Ok(mut deadlines) = self.cleanup_deadlines.lock() {
+            deadlines.entry(job_id.to_string()).or_insert(now + CLEANUP_GRACE_SECS);
+        }
+    }
+
     async fn tick(&self) -> anyhow::Result<()> {
         self.monitor_running().await?;
+        self.run_pending_cleanups().await;
         Ok(())
+    }
+
+    async fn run_pending_cleanups(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+
+        // Collect job IDs whose grace period has elapsed.
+        let due: Vec<String> = {
+            let deadlines = match self.cleanup_deadlines.lock() {
+                Ok(d) => d,
+                Err(_) => return,
+            };
+            deadlines
+                .iter()
+                .filter(|(_, &deadline)| now >= deadline)
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+
+        for job_id in &due {
+            // Look up the job to get provider info
+            if let Ok(Some(job)) = self.store.get_job(job_id) {
+                if let Some(ref provider_job_id) = job.provider_job_id {
+                    let handle = JobHandle {
+                        provider_name: job.provider_name.clone(),
+                        provider_job_id: provider_job_id.clone(),
+                        launched_at: job.dispatched_at.unwrap_or(0.0),
+                    };
+                    if let Err(e) = self.bridge.cleanup(&job.provider_name, &handle).await {
+                        tracing::warn!("cleanup failed for job {}: {}", job_id, e);
+                        // Don't remove from deadlines — retry next tick
+                        continue;
+                    }
+                    tracing::info!("cleaned up job {} (provider resources removed)", job_id);
+                }
+            }
+
+            // Remove from deadlines map
+            if let Ok(mut deadlines) = self.cleanup_deadlines.lock() {
+                deadlines.remove(job_id);
+            }
+        }
     }
 
     async fn monitor_running(&self) -> anyhow::Result<()> {
@@ -156,6 +235,7 @@ impl Dispatcher {
                                         );
                                     }
 
+                                    self.schedule_cleanup(&j.id, now);
                                     killed_job_ids.insert(j.id.clone());
                                 }
                             }
@@ -234,11 +314,13 @@ impl Dispatcher {
                         if result.status == "completed" {
                             self.store.complete_job(&job.id, None)?;
                             self.record_cost(job, result.gpu_seconds)?;
+                            self.schedule_cleanup(&job.id, now);
                         } else if result.status == "failed" {
                             self.store.fail_job(
                                 &job.id,
                                 result.error.as_deref().unwrap_or("unknown error"),
                             )?;
+                            self.schedule_cleanup(&job.id, now);
                         }
                     }
                     Ok(ProviderResponse::Status(status)) => {
@@ -269,6 +351,12 @@ impl Dispatcher {
         if let Err(e) = self.store.kill_job(&job.id, reason) {
             tracing::error!("failed to mark job {} as killed: {}", job.id, e);
         }
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64();
+        self.schedule_cleanup(&job.id, now);
     }
 
     fn record_cost(&self, job: &Job, gpu_seconds: f64) -> anyhow::Result<()> {

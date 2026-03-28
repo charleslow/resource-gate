@@ -55,7 +55,6 @@ class JobResult:
     gpu_seconds: float
     result_payload: dict | None
     error: str | None
-    artifacts_path: str | None
 
 
 @dataclass
@@ -108,4 +107,13 @@ class ComputeProvider(Protocol):
         self, handle: JobHandle, remote_path: str, local_path: str
     ) -> None:
         """Copy a file or directory from the job environment to a local path."""
+        ...
+
+    async def cleanup(self, handle: JobHandle) -> None:
+        """Remove the job's compute resources (container, instance, etc).
+
+        Called by the orchestrator after the lease lifecycle ends and a grace
+        period has elapsed.  After cleanup, copy_in/copy_out/poll will fail.
+        Must be idempotent — calling cleanup on an already-cleaned job is a no-op.
+        """
         ...

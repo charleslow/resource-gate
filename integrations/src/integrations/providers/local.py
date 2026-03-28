@@ -1,15 +1,11 @@
 """LocalProvider — runs sprint jobs as Docker containers on the host machine.
 
-launch() → docker create + docker cp + docker start (copy-based, no bind mounts)
-poll()   → docker inspect to check container status
-cancel() → docker kill
+launch()   → docker create + docker cp + docker start (copy-based, no bind mounts)
+poll()     → docker inspect to check container status (read-only, never mutates)
+cancel()   → docker kill (stops execution, container still exists for copy_out)
+cleanup()  → docker rm -f (final removal, called by orchestrator after grace period)
 copy_in()  → docker cp local → container
 copy_out() → docker cp container → local
-
-Note: Containers are NOT launched with --rm.  We need to inspect them after
-exit to read exit code / OOM status, so auto-removal would race with the
-polling interval.  Instead we clean up explicitly via docker rm after
-recording the terminal state.
 """
 
 import asyncio
@@ -156,7 +152,6 @@ class LocalProvider:
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
                 error="container not found — may have been removed externally",
-                artifacts_path=None,
             )
 
         state = json.loads(stdout)
@@ -167,7 +162,6 @@ class LocalProvider:
             return JobStatus.RUNNING
 
         if status == "dead":
-            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=handle.launched_at,
@@ -175,7 +169,6 @@ class LocalProvider:
                 gpu_seconds=time.time() - handle.launched_at,
                 result_payload=None,
                 error="container entered 'dead' state — Docker daemon error",
-                artifacts_path=None,
             )
 
         # Container exited — use Docker's actual timestamps
@@ -188,8 +181,6 @@ class LocalProvider:
         ended_at = _parse_docker_ts(finished_at_str, time.time())
 
         if exit_code == 0 and not oom_killed:
-            # Clean up the stopped container now that we've read its state
-            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.COMPLETED,
                 started_at=started_at,
@@ -197,7 +188,6 @@ class LocalProvider:
                 gpu_seconds=ended_at - started_at,
                 result_payload={"exit_code": exit_code},
                 error=None,
-                artifacts_path=None,
             )
         else:
             # Get logs for error context before removing the container
@@ -209,8 +199,6 @@ class LocalProvider:
             else:
                 error_msg = f"exit code {exit_code}: {logs[-500:] if logs else 'no output'}"
 
-            # Clean up the stopped container
-            await _run(["docker", "rm", "-f", container_id])
             return JobResult(
                 status=JobStatus.FAILED,
                 started_at=started_at,
@@ -218,13 +206,20 @@ class LocalProvider:
                 gpu_seconds=ended_at - started_at,
                 result_payload={"exit_code": exit_code, "oom_killed": oom_killed},
                 error=error_msg,
-                artifacts_path=None,
             )
 
     async def cancel(self, handle: JobHandle) -> None:
-        """Kill and remove the Docker container."""
+        """Kill the Docker container (stop execution).
+
+        Does NOT remove the container — the orchestrator can still copy_out
+        artifacts after cancellation.  Call cleanup() to remove it.
+        """
         container_id = handle.provider_job_id
         await _run(["docker", "kill", container_id])
+
+    async def cleanup(self, handle: JobHandle) -> None:
+        """Remove the Docker container.  Idempotent."""
+        container_id = handle.provider_job_id
         await _run(["docker", "rm", "-f", container_id])
 
     async def copy_in(

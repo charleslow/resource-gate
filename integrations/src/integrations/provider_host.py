@@ -84,6 +84,11 @@ async def handle_command(cmd: dict) -> dict:
         await provider.cancel(handle)
         return {"type": "ok", "data": None}
 
+    elif method == "cleanup":
+        handle = JobHandle(**cmd["handle"])
+        await provider.cleanup(handle)
+        return {"type": "ok", "data": None}
+
     elif method == "copy_in":
         handle = JobHandle(**cmd["handle"])
         local_path = cmd["local_path"]
